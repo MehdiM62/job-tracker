@@ -20,11 +20,12 @@ A Streamlit web app that extracts job details from any URL using AI and saves th
 pip install -r requirements.txt
 ```
 
-### 2. Get an Anthropic API key
+### 2. Get a Google Gemini API key (free)
 
-1. Go to [console.anthropic.com](https://console.anthropic.com)
-2. Create an API key
-3. Copy it for the next step
+1. Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+2. Sign in with your Google account
+3. Click **Create API key** → select your Google Cloud project (same one you'll use for Sheets)
+4. Copy the key — it starts with `AIza...`
 
 ### 3. Set up Google Sheets API
 
@@ -46,7 +47,7 @@ cp .env.example .env
 
 Your `.env` should look like:
 ```
-ANTHROPIC_API_KEY=sk-ant-...
+GEMINI_API_KEY=AIza...
 GOOGLE_CREDENTIALS_FILE=credentials.json
 ```
 
@@ -67,7 +68,7 @@ Opens at `http://localhost:8501`
 3. In the app settings → **Secrets**, paste the contents of `.streamlit/secrets.toml.example` filled with your real values:
 
 ```toml
-ANTHROPIC_API_KEY = "sk-ant-..."
+GEMINI_API_KEY = "AIza..."
 
 [gcp_service_account]
 type = "service_account"

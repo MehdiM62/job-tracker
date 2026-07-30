@@ -1,7 +1,8 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-import anthropic
+from google import genai
+from google.genai import types as genai_types
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
@@ -66,20 +67,20 @@ def html_to_text(html: str) -> str:
 
 # ── AI Parsing ────────────────────────────────────────────────────────────────
 
-def get_anthropic_key() -> str:
-    key = os.getenv("ANTHROPIC_API_KEY", "")
+def get_gemini_key() -> str:
+    key = os.getenv("GEMINI_API_KEY", "")
     if not key:
         try:
-            key = st.secrets.get("ANTHROPIC_API_KEY", "")
+            key = st.secrets.get("GEMINI_API_KEY", "")
         except Exception:
             pass
     if not key:
-        raise ValueError("ANTHROPIC_API_KEY not set. Add it to .env or .streamlit/secrets.toml")
+        raise ValueError("GEMINI_API_KEY not set. Add it to .env or .streamlit/secrets.toml")
     return key
 
 
 def parse_job(text: str, url: str) -> dict:
-    client = anthropic.Anthropic(api_key=get_anthropic_key())
+    client = genai.Client(api_key=get_gemini_key())
 
     prompt = f"""Extract structured information from this job posting.
 Return ONLY a JSON object — no markdown, no explanation — with exactly these fields:
@@ -99,13 +100,14 @@ Job URL: {url}
 Job text:
 {text}"""
 
-    msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+        ),
     )
-    raw = msg.content[0].text.strip()
-    # Strip accidental markdown fences
+    raw = response.text.strip()
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
