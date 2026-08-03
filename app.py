@@ -216,6 +216,11 @@ def main():
                 st.error(f"Parsing failed: {e}")
                 st.stop()
 
+    # ── Success message (persists across rerun after form clears) ─────────────
+    if "success_msg" in st.session_state:
+        st.success(st.session_state.pop("success_msg"))
+        st.balloons()
+
     # ── Editable Review Form ───────────────────────────────────────────────────
     if "parsed" in st.session_state:
         p = st.session_state["parsed"]
@@ -226,65 +231,57 @@ def main():
         now_cet = datetime.now(CET)
         st.info(f"📅 Date Applied (CET): **{now_cet.strftime('%Y-%m-%d %H:%M')}**")
 
-        c1, c2 = st.columns(2)
-        with c1:
-            company  = st.text_input("Company",  value=p.get("company", ""))
-            city     = st.text_input("City",     value=p.get("city", ""))
-            lang_req = st.text_input("Language Requirement", value=p.get("language_req", ""))
-        with c2:
-            role    = st.text_input("Role", value=p.get("role", ""))
-            status  = st.selectbox(
-                "Status",
-                ["Applied", "Interview", "Assessment", "Offer", "Rejected", "Withdrawn"],
-            )
-            saved_lang = st.session_state.get("cv_lang", "EN")
-            cv_edit = st.radio(
-                "CV Language",
-                ["EN", "DE"],
-                index=0 if saved_lang == "EN" else 1,
-                horizontal=True,
-                key="cv_edit",
-            )
+        with st.form("job_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                company  = st.text_input("Company",  value=p.get("company", ""))
+                city     = st.text_input("City",     value=p.get("city", ""))
+                lang_req = st.text_input("Language Requirement", value=p.get("language_req", ""))
+            with c2:
+                role    = st.text_input("Role", value=p.get("role", ""))
+                status  = st.selectbox(
+                    "Status",
+                    ["Applied", "Interview", "Assessment", "Offer", "Rejected", "Withdrawn"],
+                )
+                saved_lang = st.session_state.get("cv_lang", "EN")
+                cv_edit = st.radio(
+                    "CV Language",
+                    ["EN", "DE"],
+                    index=0 if saved_lang == "EN" else 1,
+                    horizontal=True,
+                )
 
-        contact    = st.text_input("Contact Person", value=p.get("contact_person", "Not specified"))
-        key_skills = st.text_area("Key Skills Required", value=p.get("key_skills", ""), height=180)
-        comments   = st.text_area("Comments",           value=p.get("comments", ""),    height=130)
-        job_url    = st.text_input("Job URL",           value=st.session_state.get("job_url", ""))
+            contact    = st.text_input("Contact Person", value=p.get("contact_person", "Not specified"))
+            key_skills = st.text_area("Key Skills Required", value=p.get("key_skills", ""), height=180)
+            comments   = st.text_area("Comments",           value=p.get("comments", ""),    height=130)
+            job_url    = st.text_input("Job URL",           value=st.session_state.get("job_url", ""))
 
-        st.markdown("")
-        col_add, col_new = st.columns([3, 1])
+            submitted = st.form_submit_button("✅ Add to Google Sheet", type="primary", use_container_width=True)
 
-        with col_add:
-            if st.button("✅ Add to Google Sheet", type="primary", use_container_width=True):
-                with st.spinner("Saving to Google Sheet..."):
-                    try:
-                        row_no = append_job(
-                            {
-                                "company":      company,
-                                "role":         role,
-                                "city":         city,
-                                "language_req": lang_req,
-                                "key_skills":   key_skills,
-                                "contact_person": contact,
-                                "url":          job_url,
-                                "status":       status,
-                                "comments":     comments,
-                                "cv_lang":      cv_edit,
-                            }
-                        )
-                        st.success(f"🎉 Added as row #{row_no}!")
-                        del st.session_state["parsed"]
-                        st.balloons()
-                    except FileNotFoundError as e:
-                        st.error(str(e))
-                    except Exception as e:
-                        st.error(f"Failed to write to sheet: {e}")
-                        st.exception(e)
-
-        with col_new:
-            if st.button("🔄 New Job", use_container_width=True):
-                del st.session_state["parsed"]
-                st.rerun()
+        if submitted:
+            with st.spinner("Saving to Google Sheet..."):
+                try:
+                    row_no = append_job(
+                        {
+                            "company":        company,
+                            "role":           role,
+                            "city":           city,
+                            "language_req":   lang_req,
+                            "key_skills":     key_skills,
+                            "contact_person": contact,
+                            "url":            job_url,
+                            "status":         status,
+                            "comments":       comments,
+                            "cv_lang":        cv_edit,
+                        }
+                    )
+                    st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
+                    del st.session_state["parsed"]
+                    st.rerun()
+                except FileNotFoundError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"Failed to write to sheet: {e}")
 
 
 if __name__ == "__main__":
