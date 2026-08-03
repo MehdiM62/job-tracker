@@ -162,13 +162,29 @@ def main():
     st.title("💼 Job Application Tracker")
     st.caption("Paste a job URL → AI extracts details → saved to your Google Sheet")
 
+    # Increment this key after a successful save to force input widgets to reset
+    if "input_key" not in st.session_state:
+        st.session_state["input_key"] = 0
+    k = st.session_state["input_key"]
+
+    # ── Success message (shown at top, cleared after one render) ──────────────
+    if "success_msg" in st.session_state:
+        st.success(st.session_state.pop("success_msg"))
+        st.balloons()
+
     # ── Input row ──────────────────────────────────────────────────────────────
     col_url, col_lang = st.columns([5, 1])
     with col_url:
-        url = st.text_input("Job URL", placeholder="https://...")
+        url = st.text_input("Job URL", placeholder="https://...", key=f"url_{k}")
     with col_lang:
         st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
-        cv_lang = st.radio("CV", ["EN", "DE"], horizontal=True, label_visibility="collapsed")
+        cv_lang = st.radio(
+            "CV", ["EN", "DE"],
+            index=0 if st.session_state.get("cv_lang", "EN") == "EN" else 1,
+            horizontal=True,
+            label_visibility="collapsed",
+            key=f"cv_{k}",
+        )
 
     with st.expander("✏️ Or paste job description manually (for sites that block scraping)"):
         manual_text = st.text_area(
@@ -176,10 +192,10 @@ def main():
             height=220,
             placeholder="Copy the full job description from the page and paste it here...",
             label_visibility="collapsed",
+            key=f"manual_{k}",
         )
 
-    fetch_disabled = not url.strip() and not st.session_state.get("manual_text_stored", "").strip()
-    fetch = st.button("🔍 Fetch & Parse", type="primary", disabled=not (url.strip() or False))
+    fetch = st.button("🔍 Fetch & Parse", type="primary")
 
     # ── Fetch + Parse ──────────────────────────────────────────────────────────
     if fetch:
@@ -215,11 +231,6 @@ def main():
             except Exception as e:
                 st.error(f"Parsing failed: {e}")
                 st.stop()
-
-    # ── Success message (persists across rerun after form clears) ─────────────
-    if "success_msg" in st.session_state:
-        st.success(st.session_state.pop("success_msg"))
-        st.balloons()
 
     # ── Editable Review Form ───────────────────────────────────────────────────
     if "parsed" in st.session_state:
@@ -276,6 +287,8 @@ def main():
                         }
                     )
                     st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
+                    st.session_state["cv_lang"] = cv_edit  # preserve language choice
+                    st.session_state["input_key"] += 1     # clears URL + manual text
                     del st.session_state["parsed"]
                     st.rerun()
                 except FileNotFoundError as e:
