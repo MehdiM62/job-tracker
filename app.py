@@ -412,13 +412,14 @@ def main():
                     st.stop()
 
             profile = load_career_profile()
+            st.session_state["profile_loaded"] = bool(profile)
             if profile:
                 with st.spinner("Matching against your profile..."):
                     try:
                         match = match_job(parsed, profile)
                         st.session_state["match_result"] = match
-                    except Exception:
-                        pass  # matching is non-blocking
+                    except Exception as e:
+                        st.session_state["match_error"] = str(e)
 
             # Duplicate check
             with st.spinner("Checking for duplicates..."):
@@ -455,14 +456,36 @@ def main():
             # ── Match display ─────────────────────────────────────────────────
             match = st.session_state.get("match_result", {})
             if match:
-                ml = match.get("match_level", 0)
-                badge = "🟢" if ml >= 75 else ("🟡" if ml >= 45 else "🔴")
-                label = "Strong match" if ml >= 75 else ("Moderate match" if ml >= 45 else "Weak match")
-                mc1, mc2 = st.columns([1, 3])
-                with mc1:
-                    st.metric("Job Match", f"{badge} {ml}%")
-                with mc2:
-                    st.caption(f"**{label}** — {match.get('match_summary', '')}")
+                ml = int(match.get("match_level", 0))
+                if ml >= 75:
+                    bar_color, bg, label = "#22c55e", "#14532d", "Strong Match"
+                elif ml >= 45:
+                    bar_color, bg, label = "#eab308", "#422006", "Moderate Match"
+                else:
+                    bar_color, bg, label = "#ef4444", "#450a0a", "Weak Match"
+
+                st.markdown(f"""
+<div style="background:{bg}; border-left:5px solid {bar_color};
+     padding:18px 20px; border-radius:10px; margin-bottom:12px;">
+  <div style="display:flex; align-items:center; gap:20px;">
+    <div style="font-size:2.8em; font-weight:900; color:{bar_color}; line-height:1;">{ml}%</div>
+    <div>
+      <div style="font-size:1.15em; font-weight:700; color:{bar_color};">{label}</div>
+      <div style="font-size:0.9em; color:#d1d5db; margin-top:4px;">{match.get("match_summary","")}</div>
+    </div>
+  </div>
+  <div style="margin-top:12px; background:#ffffff18; border-radius:6px; height:10px; overflow:hidden;">
+    <div style="width:{ml}%; background:{bar_color}; height:100%; border-radius:6px;"></div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+            elif st.session_state.get("profile_loaded") is False:
+                st.info(
+                    "💡 **Job matching not available** — career profile not found. "
+                    "Add `career_profile` to your Streamlit secrets to enable matching."
+                )
+            elif st.session_state.get("match_error"):
+                st.warning(f"⚠️ Matching failed: {st.session_state['match_error']}")
 
             st.info(f"📅 Date Applied (CET): **{datetime.now(CET).strftime('%Y-%m-%d %H:%M')}**")
 
