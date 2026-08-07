@@ -93,6 +93,14 @@ def html_to_text(html: str) -> str:
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
+def format_bullets(text: str) -> str:
+    """Guarantee each • bullet point is on its own line."""
+    if not text or "•" not in text:
+        return text
+    parts = [p.strip() for p in text.split("•") if p.strip()]
+    return "\n".join("• " + p for p in parts)
+
+
 def get_groq_key() -> str:
     key = os.getenv("GROQ_API_KEY", "")
     if not key:
@@ -131,7 +139,10 @@ Job text:
         response_format={"type": "json_object"},
         temperature=0,
     )
-    return json.loads(response.choices[0].message.content)
+    result = json.loads(response.choices[0].message.content)
+    result["key_skills"] = format_bullets(result.get("key_skills", ""))
+    result["comments"]   = format_bullets(result.get("comments", ""))
+    return result
 
 
 def parse_email(email_text: str, jobs: list) -> dict:
@@ -155,7 +166,7 @@ Return ONLY a JSON object with these fields:
   "matched_role": "<role/position from the email>",
   "email_date": "<date the email was sent, YYYY-MM-DD format>",
   "new_status": "<updated status — one of: Applied, Interview, Assessment, Offer, Rejected, Withdrawn>",
-  "company_comments": "<concise bullet-point summary: start with the email date, then list key info such as interview date/time/format, rejection reason, next steps, salary details, any feedback. Each point starts with •>",
+  "company_comments": "<concise summary where EACH point is on its own line starting with •\\n, e.g.: • Email date: 2026-08-07\\n• Interview: 2026-08-14 10:00 via Teams\\n• Rejection reason: overqualified>",
   "confidence": "<high, medium, or low — how confident you are about which job this email refers to>"
 }}"""
 
@@ -165,7 +176,9 @@ Return ONLY a JSON object with these fields:
         response_format={"type": "json_object"},
         temperature=0,
     )
-    return json.loads(response.choices[0].message.content)
+    result = json.loads(response.choices[0].message.content)
+    result["company_comments"] = format_bullets(result.get("company_comments", ""))
+    return result
 
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -259,6 +272,8 @@ def main():
 
     if "input_key" not in st.session_state:
         st.session_state["input_key"] = 0
+    if "email_key" not in st.session_state:
+        st.session_state["email_key"] = 0
 
     if "success_msg" in st.session_state:
         st.success(st.session_state.pop("success_msg"))
@@ -431,11 +446,13 @@ def main():
         st.subheader("Update application status from an email")
         st.caption("Paste an email you received from a recruiter or company — the AI will identify the job and extract key information.")
 
+        ek = st.session_state["email_key"]
         email_text = st.text_area(
             "Email content",
             height=280,
             placeholder="Paste the full email here (subject + body)...",
             label_visibility="collapsed",
+            key=f"email_{ek}",
         )
 
         parse_email_btn = st.button("🔍 Parse Email", type="primary", key="parse_email_btn")
@@ -530,6 +547,7 @@ def main():
                             )
                             st.session_state.pop("email_parsed", None)
                             st.session_state.pop("email_jobs", None)
+                            st.session_state["email_key"] += 1  # clears email text area
                             st.rerun()
                         else:
                             st.error(f"Row #{selected_row_no} not found in the sheet.")
