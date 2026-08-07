@@ -93,6 +93,19 @@ def html_to_text(html: str) -> str:
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
+PROFILE_PATH = os.path.join(os.path.dirname(__file__), "Mehdi_Mokhtari_Master_Career_Knowledge_Base.md")
+
+def load_career_profile() -> str:
+    """Load career profile from local file (dev) or Streamlit secrets (cloud)."""
+    if os.path.exists(PROFILE_PATH):
+        with open(PROFILE_PATH, encoding="utf-8") as f:
+            return f.read()
+    try:
+        return st.secrets.get("career_profile", "")
+    except Exception:
+        return ""
+
+
 def format_bullets(text: str) -> str:
     """Guarantee each • bullet point is on its own line."""
     if not text or "•" not in text:
@@ -181,6 +194,45 @@ Return ONLY a JSON object with these fields:
     return result
 
 
+def match_job(parsed: dict, profile: str) -> dict:
+    """Compare parsed job against the career profile. Returns match_level (0-100),
+    match_summary, and missing_skills."""
+    client = Groq(api_key=get_groq_key())
+
+    job_snapshot = (
+        f"Role: {parsed.get('role', '')}\n"
+        f"Company: {parsed.get('company', '')}\n"
+        f"Language requirement: {parsed.get('language_req', '')}\n"
+        f"Key skills required:\n{parsed.get('key_skills', '')}\n"
+        f"Comments / requirements:\n{parsed.get('comments', '')}"
+    )
+
+    prompt = f"""You are a career advisor performing a job-fit analysis.
+
+CANDIDATE PROFILE:
+{profile[:7000]}
+
+JOB POSTING:
+{job_snapshot}
+
+Analyse how well the candidate fits this job and return ONLY a JSON object:
+{{
+  "match_level": <integer 0–100, where 100 = perfect fit>,
+  "match_summary": "<one concise sentence explaining the score>",
+  "missing_skills": "<skills or requirements from the job the candidate clearly lacks — one per line starting with •. Write None if there are no gaps.>"
+}}"""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+    result = json.loads(response.choices[0].message.content)
+    result["missing_skills"] = format_bullets(result.get("missing_skills", ""))
+    return result
+
+
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 
 def get_worksheet():
@@ -199,16 +251,25 @@ def get_worksheet():
     return gc.open_by_key(SHEET_ID).sheet1
 
 
-def ensure_company_comments_col(ws) -> int:
-    """Returns 1-based column index for 'Company Comments', adding header if missing.
-    Assumes Source already occupies column M; Company Comments goes in the next free column."""
+EXTRA_COLS = ["Company Comments", "Match Level", "Missing Skills"]
+
+def ensure_extra_cols(ws) -> dict:
+    """Ensures Company Comments, Match Level, and Missing Skills columns exist.
+    Returns dict of column_name → 1-based index."""
     header = ws.row_values(1)
-    if "Company Comments" in header:
-        return header.index("Company Comments") + 1
-    # Place it after the last populated header cell
-    col = len([h for h in header if h.strip()]) + 1
-    ws.update_cell(1, col, "Company Comments")
-    return col
+    indices = {}
+    next_col = len([h for h in header if h.strip()]) + 1
+
+    for name in EXTRA_COLS:
+        if name in header:
+            indices[name] = header.index(name) + 1
+        else:
+            ws.update_cell(1, next_col, name)
+            indices[name] = next_col
+            next_col += 1
+            header.append(name)  # keep header in sync for subsequent lookups
+
+    return indices
 
 
 def get_all_jobs(ws) -> list:
@@ -228,19 +289,23 @@ def find_duplicate(ws, url: str, company: str, role: str) -> dict | None:
 
 def append_job(data: dict) -> int:
     ws = get_worksheet()
-    ensure_company_comments_col(ws)
+    ensure_extra_cols(ws)
     all_rows = ws.get_all_values()
     data_rows = [r for r in all_rows[1:] if any(cell.strip() for cell in r)]
     next_no = len(data_rows) + 1
     now_cet = datetime.now(CET).strftime("%Y-%m-%d %H:%M")
+    ml = data.get("match_level", "")
+    match_display = f"{ml}%" if isinstance(ml, int) else str(ml)
     ws.append_row(
         [
             next_no, now_cet,
             data["company"], data["role"], data["city"],
             data["language_req"], data["key_skills"], data["contact_person"],
             data["url"], data["status"], data["comments"], data["cv_lang"],
-            data.get("source", ""),  # M — Source
-            "",                      # N — Company Comments (empty on creation)
+            data.get("source", ""),          # M — Source
+            "",                              # N — Company Comments
+            match_display,                   # O — Match Level
+            data.get("missing_skills", ""),  # P — Missing Skills
         ],
         value_input_option="USER_ENTERED",
     )
@@ -249,10 +314,11 @@ def append_job(data: dict) -> int:
 
 def update_job_from_email(row_no: int, new_status: str, company_comments: str) -> bool:
     ws = get_worksheet()
+    col_map = ensure_extra_cols(ws)
     all_values = ws.get_all_values()
     header = all_values[0]
     status_col = header.index("Status") + 1
-    cc_col = ensure_company_comments_col(ws)
+    cc_col = col_map["Company Comments"]
 
     for i, row in enumerate(all_values[1:], start=2):
         if row and str(row[0]).strip() == str(row_no):
@@ -337,12 +403,22 @@ def main():
                     st.session_state["job_url"] = url.strip()
                     st.session_state["cv_lang"] = cv_lang
                     st.session_state.pop("duplicate", None)
+                    st.session_state.pop("match_result", None)
                 except json.JSONDecodeError:
                     st.error("AI returned unexpected output. Try again.")
                     st.stop()
                 except Exception as e:
                     st.error(f"Parsing failed: {e}")
                     st.stop()
+
+            profile = load_career_profile()
+            if profile:
+                with st.spinner("Matching against your profile..."):
+                    try:
+                        match = match_job(parsed, profile)
+                        st.session_state["match_result"] = match
+                    except Exception:
+                        pass  # matching is non-blocking
 
             # Duplicate check
             with st.spinner("Checking for duplicates..."):
@@ -375,6 +451,19 @@ def main():
                 )
 
             st.subheader("Review & Edit")
+
+            # ── Match display ─────────────────────────────────────────────────
+            match = st.session_state.get("match_result", {})
+            if match:
+                ml = match.get("match_level", 0)
+                badge = "🟢" if ml >= 75 else ("🟡" if ml >= 45 else "🔴")
+                label = "Strong match" if ml >= 75 else ("Moderate match" if ml >= 45 else "Weak match")
+                mc1, mc2 = st.columns([1, 3])
+                with mc1:
+                    st.metric("Job Match", f"{badge} {ml}%")
+                with mc2:
+                    st.caption(f"**{label}** — {match.get('match_summary', '')}")
+
             st.info(f"📅 Date Applied (CET): **{datetime.now(CET).strftime('%Y-%m-%d %H:%M')}**")
 
             # Detect source from URL; fall back to last used source
@@ -404,6 +493,11 @@ def main():
                 contact    = st.text_input("Contact Person", value=p.get("contact_person", "Not specified"))
                 key_skills = st.text_area("Key Skills Required", value=p.get("key_skills", ""), height=180)
                 comments   = st.text_area("Comments", value=p.get("comments", ""), height=130)
+                missing_skills = st.text_area(
+                    "Missing Skills (gaps vs your profile)",
+                    value=match.get("missing_skills", "") if match else "",
+                    height=120,
+                )
                 job_url    = st.text_input("Job URL", value=st.session_state.get("job_url", ""))
 
                 if dup:
@@ -426,6 +520,8 @@ def main():
                             "contact_person": contact, "url": job_url,
                             "status": status, "comments": comments,
                             "cv_lang": cv_edit, "source": source,
+                            "match_level": match.get("match_level", "") if match else "",
+                            "missing_skills": missing_skills,
                         })
                         st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
                         st.session_state["cv_lang"] = cv_edit
