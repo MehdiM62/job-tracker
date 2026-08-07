@@ -17,6 +17,34 @@ CET = pytz.timezone("Europe/Berlin")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 STATUSES = ["Applied", "Interview", "Assessment", "Offer", "Rejected", "Withdrawn"]
 
+# Domain → display name (order matters; first match wins)
+SOURCE_DOMAINS = {
+    "linkedin.com":       "LinkedIn",
+    "stepstone.de":       "StepStone",
+    "xing.com":           "XING",
+    "glassdoor.com":      "Glassdoor",
+    "it-jobs.de":         "IT-Jobs",
+    "indeed.":            "Indeed",
+    "get-in-it.de":       "get-in-it",
+    "monster.de":         "Monster",
+    "jobworld.de":        "jobworld",
+    "talent-berlin.de":   "Talent Berlin",
+    "englishjobs.de":     "English Jobs",
+    "instaffo.com":       "Instaffo",
+    "whybrilliant.com":   "whybrilliant",
+    "arbeitsagentur.de":  "Arbeitsagentur",
+}
+# Deduplicated ordered list for the dropdown
+SOURCES = list(dict.fromkeys(SOURCE_DOMAINS.values()))
+
+
+def detect_source(url: str) -> str | None:
+    url_lower = url.lower()
+    for domain, name in SOURCE_DOMAINS.items():
+        if domain in url_lower:
+            return name
+    return None
+
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -159,11 +187,13 @@ def get_worksheet():
 
 
 def ensure_company_comments_col(ws) -> int:
-    """Returns 1-based column index for 'Company Comments', adding header if missing."""
+    """Returns 1-based column index for 'Company Comments', adding header if missing.
+    Assumes Source already occupies column M; Company Comments goes in the next free column."""
     header = ws.row_values(1)
     if "Company Comments" in header:
         return header.index("Company Comments") + 1
-    col = len(header) + 1
+    # Place it after the last populated header cell
+    col = len([h for h in header if h.strip()]) + 1
     ws.update_cell(1, col, "Company Comments")
     return col
 
@@ -196,7 +226,8 @@ def append_job(data: dict) -> int:
             data["company"], data["role"], data["city"],
             data["language_req"], data["key_skills"], data["contact_person"],
             data["url"], data["status"], data["comments"], data["cv_lang"],
-            "",  # Company Comments — empty on creation
+            data.get("source", ""),  # M — Source
+            "",                      # N — Company Comments (empty on creation)
         ],
         value_input_option="USER_ENTERED",
     )
@@ -331,6 +362,13 @@ def main():
             st.subheader("Review & Edit")
             st.info(f"📅 Date Applied (CET): **{datetime.now(CET).strftime('%Y-%m-%d %H:%M')}**")
 
+            # Detect source from URL; fall back to last used source
+            _job_url = st.session_state.get("job_url", "")
+            _detected = detect_source(_job_url)
+            _last = st.session_state.get("last_source", SOURCES[0])
+            _default_source = _detected or _last
+            _source_idx = SOURCES.index(_default_source) if _default_source in SOURCES else 0
+
             with st.form("job_form"):
                 c1, c2 = st.columns(2)
                 with c1:
@@ -346,6 +384,8 @@ def main():
                         horizontal=True,
                     )
 
+                source     = st.selectbox("Source", SOURCES, index=_source_idx,
+                                          help="Auto-detected from URL. Change if needed.")
                 contact    = st.text_input("Contact Person", value=p.get("contact_person", "Not specified"))
                 key_skills = st.text_area("Key Skills Required", value=p.get("key_skills", ""), height=180)
                 comments   = st.text_area("Comments", value=p.get("comments", ""), height=130)
@@ -369,10 +409,12 @@ def main():
                             "company": company, "role": role, "city": city,
                             "language_req": lang_req, "key_skills": key_skills,
                             "contact_person": contact, "url": job_url,
-                            "status": status, "comments": comments, "cv_lang": cv_edit,
+                            "status": status, "comments": comments,
+                            "cv_lang": cv_edit, "source": source,
                         })
                         st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
                         st.session_state["cv_lang"] = cv_edit
+                        st.session_state["last_source"] = source
                         st.session_state["input_key"] += 1
                         st.session_state.pop("parsed", None)
                         st.session_state.pop("duplicate", None)
