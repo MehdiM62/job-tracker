@@ -112,9 +112,14 @@ def load_career_profile() -> str:
         return ""
 
 
-def format_bullets(text: str) -> str:
+def format_bullets(text) -> str:
     """Guarantee each • bullet point is on its own line."""
-    if not text or "•" not in text:
+    if isinstance(text, list):
+        items = [str(i).strip().lstrip("•").strip() for i in text if str(i).strip()]
+        return "\n".join("• " + i for i in items)
+    if not text or not isinstance(text, str):
+        return text or ""
+    if "•" not in text:
         return text
     parts = [p.strip() for p in text.split("•") if p.strip()]
     return "\n".join("• " + p for p in parts)
