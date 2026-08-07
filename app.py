@@ -101,7 +101,13 @@ def load_career_profile() -> str:
         with open(PROFILE_PATH, encoding="utf-8") as f:
             return f.read()
     try:
-        return st.secrets.get("career_profile", "")
+        # Top-level key (correct position — above any [section] header)
+        profile = st.secrets.get("career_profile", "")
+        if profile:
+            return profile
+        # Fallback: mistakenly placed inside [gcp_service_account]
+        profile = st.secrets.get("gcp_service_account", {}).get("career_profile", "")
+        return profile
     except Exception:
         return ""
 
