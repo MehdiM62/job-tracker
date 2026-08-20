@@ -210,7 +210,7 @@ Return ONLY a JSON object with these fields:
   "email_date": "<date the email was sent/received, YYYY-MM-DD format — read it from the email's own date/header/signature, not today's date>",
   "new_status": "<updated status — one of: Applied, Interview, Assessment, Offer, Rejected, Withdrawn>",
   "company_comments": "<concise summary of what THIS email says, one point per line starting with •\\n — do not include the email date, it is recorded separately, e.g.: • Interview invite: 2026-08-14 10:00 via Teams\\n• Next round: technical interview\\n• Rejection reason: overqualified>",
-  "confidence": "<high, medium, or low — how confident you are about which job this email refers to>"
+  "confidence": "<high, medium, or low — confidence that matched_row is the CORRECT row in the applied jobs list above. If matched_row is null, this must be low, even if you're sure about the company/role from the email itself>"
 }}"""
 
     response = client.chat.completions.create(
@@ -837,16 +837,24 @@ def main():
             st.divider()
             st.subheader("Review & Apply Update")
 
-            confidence = r.get("confidence", "low")
-            conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "🔴")
-            st.caption(f"Match confidence: {conf_color} **{confidence.upper()}**")
+            matched_row = r.get("matched_row")
+            if matched_row is None:
+                st.warning(
+                    f"⚠️ No matching application found for **{r.get('matched_company', 'this company')} — "
+                    f"{r.get('matched_role', 'this role')}**. It may not be tracked yet, or falls outside "
+                    f"the recent-applications window sent to the AI — select the correct row below, or "
+                    f"add it as a new job first (Add Job tab) if it's missing entirely."
+                )
+            else:
+                confidence = r.get("confidence", "low")
+                conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "🔴")
+                st.caption(f"Match confidence: {conf_color} **{confidence.upper()}**")
 
             # Job selector — pre-select what AI found, let user override
             job_options = {
                 f"Row {j.get('No.')} — {j.get('Company')} | {j.get('Role')} | {j.get('Status')}": j.get("No.")
                 for j in jobs
             }
-            matched_row = r.get("matched_row")
             default_idx = 0
             for i, no in enumerate(job_options.values()):
                 if no == matched_row:
