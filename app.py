@@ -8,6 +8,7 @@ from datetime import datetime
 import pytz
 import json
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -196,6 +197,10 @@ def parse_email(email_text: str, jobs: list) -> dict:
 
     prompt = f"""You help track job applications. Analyze this email from a recruiter or company and match it to one of the applied jobs below.
 
+If the company name isn't spelled out in the email body, infer it from the sender's
+email domain (e.g. "haakon@bbraun.com" → "B. Braun") and match on that — recruiters
+often only identify their company through the domain, not the visible text.
+
 Applied jobs:
 {jobs_list}{truncated_note}
 
@@ -222,6 +227,33 @@ Return ONLY a JSON object with these fields:
     result = json.loads(response.choices[0].message.content)
     result["company_comments"] = format_bullets(result.get("company_comments", ""))
     return result
+
+
+CORP_SUFFIX_RE = re.compile(r"\b(gmbh|se|ag|inc|ltd|llc|kg|corp|corporation|plc|co)\b")
+
+def normalize_company(name: str) -> str:
+    name = name.lower()
+    name = CORP_SUFFIX_RE.sub("", name)
+    return re.sub(r"[^a-z0-9]", "", name)
+
+
+def fuzzy_find_job(matched_company: str, jobs: list):
+    """Deterministic backstop for when the AI can't confidently match a row (e.g. the
+    company is only identifiable via the sender's email domain, which this model
+    doesn't infer reliably every time). Normalizes company names and checks for a
+    substring match against the FULL job history, not just the truncated AI candidate
+    list — cheap and local, no extra API call. Requires a minimum length and a single
+    unambiguous candidate, since short names (e.g. "SAP") risk false substring matches
+    (e.g. "Sapient") and a wrong specific suggestion is worse than admitting no match."""
+    target = normalize_company(matched_company or "")
+    if len(target) < 4:
+        return None
+    candidates = [
+        j.get("No.") for j in jobs
+        if (c := normalize_company(str(j.get("Company", "")))) and (target in c or c in target)
+    ]
+    unique_rows = set(candidates)
+    return candidates[0] if len(unique_rows) == 1 else None
 
 
 def match_job(parsed: dict, profile: str) -> dict:
@@ -838,7 +870,17 @@ def main():
             st.subheader("Review & Apply Update")
 
             matched_row = r.get("matched_row")
+            fuzzy_matched = False
             if matched_row is None:
+                matched_row = fuzzy_find_job(r.get("matched_company", ""), jobs)
+                fuzzy_matched = matched_row is not None
+
+            if fuzzy_matched:
+                st.info(
+                    f"🔎 AI wasn't sure, but found Row {matched_row} by matching the company name "
+                    f"**{r.get('matched_company', '')}** — please confirm it's correct below."
+                )
+            elif matched_row is None:
                 st.warning(
                     f"⚠️ No matching application found for **{r.get('matched_company', 'this company')} — "
                     f"{r.get('matched_role', 'this role')}**. It may not be tracked yet, or falls outside "
