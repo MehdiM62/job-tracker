@@ -188,9 +188,9 @@ Return ONLY a JSON object with these fields:
   "matched_row": <row number as integer, or null if unclear>,
   "matched_company": "<company name from the email>",
   "matched_role": "<role/position from the email>",
-  "email_date": "<date the email was sent, YYYY-MM-DD format>",
+  "email_date": "<date the email was sent/received, YYYY-MM-DD format — read it from the email's own date/header/signature, not today's date>",
   "new_status": "<updated status — one of: Applied, Interview, Assessment, Offer, Rejected, Withdrawn>",
-  "company_comments": "<concise summary where EACH point is on its own line starting with •\\n, e.g.: • Email date: 2026-08-07\\n• Interview: 2026-08-14 10:00 via Teams\\n• Rejection reason: overqualified>",
+  "company_comments": "<concise summary of what THIS email says, one point per line starting with •\\n — do not include the email date, it is recorded separately, e.g.: • Interview invite: 2026-08-14 10:00 via Teams\\n• Next round: technical interview\\n• Rejection reason: overqualified>",
   "confidence": "<high, medium, or low — how confident you are about which job this email refers to>"
 }}"""
 
@@ -323,7 +323,10 @@ def append_job(data: dict) -> int:
     return next_no
 
 
-def update_job_from_email(row_no: int, new_status: str, company_comments: str) -> bool:
+def update_job_from_email(row_no: int, new_status: str, company_comments: str, email_date: str) -> bool:
+    """Applies an email-derived update as a new dated history entry appended to
+    Company Comments — prior entries (status changes, interview steps, etc.)
+    are preserved rather than overwritten."""
     ws = get_worksheet()
     col_map = ensure_extra_cols(ws)
     all_values = ws.get_all_values()
@@ -333,9 +336,19 @@ def update_job_from_email(row_no: int, new_status: str, company_comments: str) -
 
     for i, row in enumerate(all_values[1:], start=2):
         if row and str(row[0]).strip() == str(row_no):
+            old_status = row[status_col - 1] if len(row) >= status_col else ""
             ws.update_cell(i, status_col, new_status)
+
+            date_str = email_date.strip() if email_date and email_date.strip() else datetime.now(CET).strftime("%Y-%m-%d")
+            status_line = (
+                f"Status: {old_status} → {new_status}"
+                if old_status and old_status != new_status
+                else f"Status: {new_status}"
+            )
+            entry = f"📧 {date_str} | {status_line}\n{company_comments.strip()}".strip()
+
             existing = row[cc_col - 1] if len(row) >= cc_col else ""
-            combined = (existing.strip() + "\n\n" + company_comments).strip() if existing.strip() else company_comments
+            combined = (existing.strip() + "\n\n---\n\n" + entry).strip() if existing.strip() else entry
             ws.update_cell(i, cc_col, combined)
             return True
     return False
@@ -665,12 +678,7 @@ def main():
             if apply_btn:
                 with st.spinner("Updating sheet..."):
                     try:
-                        # Prepend email date to comments if not already there
-                        comment_with_date = company_comments.strip()
-                        if email_date and email_date not in comment_with_date:
-                            comment_with_date = f"📧 {email_date}\n{comment_with_date}"
-
-                        ok = update_job_from_email(selected_row_no, new_status, comment_with_date)
+                        ok = update_job_from_email(selected_row_no, new_status, company_comments, email_date)
                         if ok:
                             st.session_state["success_msg"] = (
                                 f"✅ Row #{selected_row_no} updated — Status: {new_status}"
