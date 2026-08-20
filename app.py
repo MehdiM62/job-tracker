@@ -300,6 +300,25 @@ def find_duplicate(ws, url: str, company: str, role: str) -> dict | None:
     return None
 
 
+def format_row(ws, row_num: int) -> None:
+    """Keeps a data row visually consistent with the rest of the sheet: Date Applied
+    stays a real right-aligned date, and the bulleted columns wrap with top alignment
+    so short cells don't inherit empty space from a taller cell in the same row."""
+    ws.batch_format([
+        {
+            "range": f"B{row_num}",
+            "format": {
+                "numberFormat": {"type": "DATE_TIME", "pattern": "yyyy-mm-dd hh:mm"},
+                "horizontalAlignment": "RIGHT",
+            },
+        },
+        {
+            "range": f"A{row_num}:P{row_num}",
+            "format": {"verticalAlignment": "TOP", "wrapStrategy": "WRAP"},
+        },
+    ])
+
+
 def append_job(data: dict) -> int:
     ws = get_worksheet()
     ensure_extra_cols(ws)
@@ -322,6 +341,7 @@ def append_job(data: dict) -> int:
         ],
         value_input_option="USER_ENTERED",
     )
+    format_row(ws, next_no + 1)
     return next_no
 
 
@@ -352,6 +372,7 @@ def update_job_from_email(row_no: int, new_status: str, company_comments: str, e
             existing = row[cc_col - 1] if len(row) >= cc_col else ""
             combined = (existing.strip() + "\n\n---\n\n" + entry).strip() if existing.strip() else entry
             ws.update_cell(i, cc_col, combined)
+            format_row(ws, i)
             return True
     return False
 
