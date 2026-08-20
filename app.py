@@ -339,6 +339,77 @@ def format_row(ws, row_num: int, bullet_texts: list) -> None:
     })
 
 
+MULTI_LINE_COLS = ["Key Skills Required", "Comments", "Company Comments", "Missing Skills"]
+
+def normalize_sheet_formatting(ws) -> dict:
+    """One-shot cleanup for rows edited directly in the sheet (e.g. pasting a raw
+    LinkedIn Q&A export straight into Comments), which bypasses format_row entirely.
+    Converts any pipe-delimited text not already bulleted into bullet lines, then
+    reapplies clip/top-align/height formatting to every data row. Safe to run
+    repeatedly — already-clean rows are left as-is."""
+    header = ws.row_values(1)
+    comments_idx = header.index("Comments")
+    multi_idx = [header.index(c) for c in MULTI_LINE_COLS]
+
+    all_values = ws.get_all_values()
+    data = all_values[1:]
+    n_rows = len(data)
+    if n_rows == 0:
+        return {"rows_scanned": 0, "bullets_fixed": 0}
+
+    value_updates = []
+    for i, row in enumerate(data):
+        raw = row[comments_idx] if comments_idx < len(row) else ""
+        if " | " in raw and not raw.strip().startswith("•"):
+            segments = [s.strip() for s in raw.split(" | ") if s.strip()]
+            new_val = "\n".join("• " + s for s in segments)
+            value_updates.append((i + 2, new_val))
+            while len(row) <= comments_idx:
+                row.append("")
+            row[comments_idx] = new_val
+
+    if value_updates:
+        ws.batch_update(
+            [{"range": f"K{row_num}", "values": [[val]]} for row_num, val in value_updates],
+            value_input_option=gspread.utils.ValueInputOption.raw,
+        )
+
+    heights = []
+    for row in data:
+        max_lines = 1
+        for idx in multi_idx:
+            if idx < len(row) and row[idx].strip():
+                max_lines = max(max_lines, row[idx].count("\n") + 1)
+        heights.append(ROW_BASE_PX + min(max_lines, ROW_MAX_LINES) * ROW_LINE_PX)
+
+    requests = [{
+        "repeatCell": {
+            "range": {
+                "sheetId": ws.id, "startRowIndex": 1, "endRowIndex": n_rows + 1,
+                "startColumnIndex": 0, "endColumnIndex": 16,
+            },
+            "cell": {"userEnteredFormat": {"verticalAlignment": "TOP", "wrapStrategy": "CLIP"}},
+            "fields": "userEnteredFormat.verticalAlignment,userEnteredFormat.wrapStrategy",
+        }
+    }]
+    start = 0
+    for i in range(1, len(heights) + 1):
+        if i == len(heights) or heights[i] != heights[start]:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {"sheetId": ws.id, "dimension": "ROWS", "startIndex": start + 1, "endIndex": i + 1},
+                    "properties": {"pixelSize": heights[start]},
+                    "fields": "pixelSize",
+                }
+            })
+            start = i
+
+    for chunk_start in range(0, len(requests), 300):
+        ws.spreadsheet.batch_update({"requests": requests[chunk_start:chunk_start + 300]})
+
+    return {"rows_scanned": n_rows, "bullets_fixed": len(value_updates)}
+
+
 def append_job(data: dict) -> int:
     ws = get_worksheet()
     ensure_extra_cols(ws)
@@ -423,6 +494,24 @@ def main():
     # TAB 1 — Add Job
     # ══════════════════════════════════════════════════════════════════════════
     with tab_add:
+        with st.expander("🧹 Normalize formatting"):
+            st.caption(
+                "Run this after pasting data directly into the sheet (e.g. a raw LinkedIn "
+                "Q&A export into Comments) — converts pipe-delimited text to bullets and "
+                "reapplies consistent row formatting. Safe to run repeatedly."
+            )
+            if st.button("Normalize formatting"):
+                with st.spinner("Scanning and reformatting..."):
+                    try:
+                        ws = get_worksheet()
+                        result = normalize_sheet_formatting(ws)
+                        st.success(
+                            f"✅ Scanned {result['rows_scanned']} rows — "
+                            f"fixed bullets on {result['bullets_fixed']} row(s)."
+                        )
+                    except Exception as e:
+                        st.error(f"Normalization failed: {e}")
+
         k = st.session_state["input_key"]
 
         col_url, col_lang = st.columns([5, 1])
