@@ -300,10 +300,16 @@ def find_duplicate(ws, url: str, company: str, role: str) -> dict | None:
     return None
 
 
-def format_row(ws, row_num: int) -> None:
+ROW_BASE_PX = 5
+ROW_LINE_PX = 16
+ROW_MAX_LINES = 10
+
+def format_row(ws, row_num: int, bullet_texts: list) -> None:
     """Keeps a data row visually consistent with the rest of the sheet: Date Applied
-    stays a real right-aligned date, and the bulleted columns wrap with top alignment
-    so short cells don't inherit empty space from a taller cell in the same row."""
+    stays a real right-aligned date, and the bulleted columns clip each bullet to a
+    single line (long ones get cut off, not wrapped) with top alignment. Row height
+    is sized to the tallest cell's bullet count, capped at ROW_MAX_LINES so a long
+    history doesn't balloon the row — it takes exactly the space it needs, no more."""
     ws.batch_format([
         {
             "range": f"B{row_num}",
@@ -314,9 +320,23 @@ def format_row(ws, row_num: int) -> None:
         },
         {
             "range": f"A{row_num}:P{row_num}",
-            "format": {"verticalAlignment": "TOP", "wrapStrategy": "WRAP"},
+            "format": {"verticalAlignment": "TOP", "wrapStrategy": "CLIP"},
         },
     ])
+    max_lines = max([t.count("\n") + 1 for t in bullet_texts if t and t.strip()], default=1)
+    height = ROW_BASE_PX + min(max_lines, ROW_MAX_LINES) * ROW_LINE_PX
+    ws.spreadsheet.batch_update({
+        "requests": [{
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": ws.id, "dimension": "ROWS",
+                    "startIndex": row_num - 1, "endIndex": row_num,
+                },
+                "properties": {"pixelSize": height},
+                "fields": "pixelSize",
+            }
+        }]
+    })
 
 
 def append_job(data: dict) -> int:
@@ -341,7 +361,7 @@ def append_job(data: dict) -> int:
         ],
         value_input_option="USER_ENTERED",
     )
-    format_row(ws, next_no + 1)
+    format_row(ws, next_no + 1, [data["key_skills"], data["comments"], data.get("missing_skills", "")])
     return next_no
 
 
@@ -354,6 +374,8 @@ def update_job_from_email(row_no: int, new_status: str, company_comments: str, e
     all_values = ws.get_all_values()
     header = all_values[0]
     status_col = header.index("Status") + 1
+    skills_col = header.index("Key Skills Required") + 1
+    missing_col = header.index("Missing Skills") + 1
     cc_col = col_map["Company Comments"]
 
     for i, row in enumerate(all_values[1:], start=2):
@@ -372,7 +394,10 @@ def update_job_from_email(row_no: int, new_status: str, company_comments: str, e
             existing = row[cc_col - 1] if len(row) >= cc_col else ""
             combined = (existing.strip() + "\n\n---\n\n" + entry).strip() if existing.strip() else entry
             ws.update_cell(i, cc_col, combined)
-            format_row(ws, i)
+
+            skills = row[skills_col - 1] if len(row) >= skills_col else ""
+            missing = row[missing_col - 1] if len(row) >= missing_col else ""
+            format_row(ws, i, [skills, combined, missing])
             return True
     return False
 
