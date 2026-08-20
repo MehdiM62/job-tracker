@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+APP_PASSWORD = "abc123"
+
 SHEET_ID = "1-9pSqdaqp8Sx_jhq1dq-KE0ExN4BdkHmpSXg-tzeEms"
 CET = pytz.timezone("Europe/Berlin")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -473,10 +475,42 @@ def update_job_from_email(row_no: int, new_status: str, company_comments: str, e
     return False
 
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+# Hardcoded password gate — stops a stumbled-upon URL from touching real data.
+# Not real security (the password travels in the URL), just a low-effort filter.
+
+def is_authenticated() -> bool:
+    if st.session_state.get("authenticated"):
+        return True
+    if st.query_params.get("pw") == APP_PASSWORD:
+        st.session_state["authenticated"] = True
+        return True
+    return False
+
+
+def login_gate() -> None:
+    st.title("🔒 Job Tracker")
+    with st.form("login_form"):
+        pw = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in", type="primary")
+    if submitted:
+        if pw == APP_PASSWORD:
+            st.session_state["authenticated"] = True
+            st.query_params["pw"] = APP_PASSWORD
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(page_title="Job Tracker", page_icon="💼", layout="centered")
+
+    if not is_authenticated():
+        login_gate()
+        st.stop()
+
     st.title("💼 Job Application Tracker")
 
     if "input_key" not in st.session_state:

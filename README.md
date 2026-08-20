@@ -73,6 +73,19 @@ Opens at `http://localhost:8501`
 
 ---
 
+## Password gate
+
+The app is gated by a single hardcoded password (`APP_PASSWORD` in `app.py`, default
+`abc123`) — just enough to stop someone who stumbles on the URL from touching your data.
+It's not real security: change `APP_PASSWORD` before deploying anywhere semi-public.
+
+After logging in, the password is appended to the URL as `?pw=...` — reloading or
+revisiting that exact URL skips the login prompt again, so bookmark it once and that
+browser/tab stays "logged in" indefinitely. Visiting the bare URL (or sharing it without
+the `?pw=...` part) asks for the password again.
+
+---
+
 ## Deploy to Streamlit Cloud (free)
 
 1. Push this repo to GitHub (make sure `.env` and `credentials.json` are gitignored)
