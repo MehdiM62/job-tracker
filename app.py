@@ -173,16 +173,31 @@ Job text:
     return result
 
 
+JOBS_LIST_CHAR_BUDGET = 12000  # keeps the prompt well under Groq's per-minute token limit
+
 def parse_email(email_text: str, jobs: list) -> dict:
     client = Groq(api_key=get_groq_key())
-    jobs_list = "\n".join([
-        f"Row {r.get('No.','')} | {r.get('Company','')} | {r.get('Role','')} | Status: {r.get('Status','')}"
-        for r in jobs
-    ])
+    # Sending every job can exceed the model's per-minute token budget once the sheet
+    # grows large (each row costs real tokens). Email updates are almost always about
+    # recent applications, so cap the candidate list to the most recent ones that fit
+    # a safe character budget — the UI's manual selector still covers full history.
+    lines, total_chars = [], 0
+    for r in reversed(jobs):
+        line = f"Row {r.get('No.', '')} | {r.get('Company', '')} | {r.get('Role', '')} | Status: {r.get('Status', '')}"
+        if total_chars + len(line) > JOBS_LIST_CHAR_BUDGET:
+            break
+        lines.append(line)
+        total_chars += len(line) + 1
+    jobs_list = "\n".join(reversed(lines))
+    truncated_note = (
+        "\n(Only the most recent applications are listed above — if none match, set matched_row to null.)"
+        if len(lines) < len(jobs) else ""
+    )
+
     prompt = f"""You help track job applications. Analyze this email from a recruiter or company and match it to one of the applied jobs below.
 
 Applied jobs:
-{jobs_list}
+{jobs_list}{truncated_note}
 
 Email:
 {email_text}
