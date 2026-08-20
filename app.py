@@ -36,6 +36,8 @@ SOURCE_DOMAINS = {
 }
 # Deduplicated ordered list for the dropdown
 SOURCES = list(dict.fromkeys(SOURCE_DOMAINS.values()))
+OTHER_SOURCE = "Other"
+SOURCE_OPTIONS = SOURCES + [OTHER_SOURCE]
 
 
 def detect_source(url: str) -> str | None:
@@ -518,7 +520,28 @@ def main():
             _detected = detect_source(_job_url)
             _last = st.session_state.get("last_source", SOURCES[0])
             _default_source = _detected or _last
-            _source_idx = SOURCES.index(_default_source) if _default_source in SOURCES else 0
+            if _default_source in SOURCE_OPTIONS:
+                _source_idx = SOURCE_OPTIONS.index(_default_source)
+                _default_other_text = ""
+            else:
+                # Previously used a custom "Other" source — reselect Other and prefill it
+                _source_idx = SOURCE_OPTIONS.index(OTHER_SOURCE)
+                _default_other_text = _default_source
+
+            # Kept outside the form so choosing "Other" can reveal the custom text box immediately
+            source_choice = st.selectbox(
+                "Source", SOURCE_OPTIONS, index=_source_idx,
+                help="Auto-detected from URL. Choose Other to enter a custom source.",
+            )
+            if source_choice == OTHER_SOURCE:
+                custom_source = st.text_input(
+                    "Custom source (optional)",
+                    value=_default_other_text,
+                    placeholder="e.g. Company website, referral, career fair",
+                )
+                source = custom_source.strip() or OTHER_SOURCE
+            else:
+                source = source_choice
 
             with st.form("job_form"):
                 c1, c2 = st.columns(2)
@@ -535,8 +558,6 @@ def main():
                         horizontal=True,
                     )
 
-                source     = st.selectbox("Source", SOURCES, index=_source_idx,
-                                          help="Auto-detected from URL. Change if needed.")
                 contact    = st.text_input("Contact Person", value=p.get("contact_person", "Not specified"))
                 key_skills = st.text_area("Key Skills Required", value=p.get("key_skills", ""), height=180)
                 comments   = st.text_area("Comments", value=p.get("comments", ""), height=130)
