@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 from groq import Groq
+from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
@@ -130,20 +131,109 @@ def format_bullets(text) -> str:
     return "\n".join("• " + p for p in parts)
 
 
-def get_groq_key() -> str:
-    key = os.getenv("GROQ_API_KEY", "")
-    if not key:
+def _get_secret(name: str) -> str:
+    """Checks os.environ first (local .env), then st.secrets (Streamlit Cloud)."""
+    value = os.getenv(name, "")
+    if not value:
         try:
-            key = st.secrets.get("GROQ_API_KEY", "")
+            value = st.secrets.get(name, "")
         except Exception:
             pass
-    if not key:
-        raise ValueError("GROQ_API_KEY not set. Add it to .env or .streamlit/secrets.toml")
-    return key
+    return value
+
+
+# ── LLM provider abstraction ────────────────────────────────────────────────
+# Qwen3.5-Flash (Alibaba Cloud Model Studio, EU/Frankfurt) is the primary provider
+# for all AI calls; Groq (GPT-OSS-120B) is an automatic fallback if Qwen fails for
+# any reason (not configured, timeout, rate limit, API error, or a malformed/
+# non-JSON response). Both providers get the exact same prompt — call_llm() is the
+# single place that knows about providers, so parse_job/parse_email/match_job stay
+# provider-agnostic and their JSON schemas are untouched.
+
+QWEN_MODEL = "qwen3.5-flash"
+QWEN_REGION_HOST = "eu-central-1.maas.aliyuncs.com"  # Model Studio Germany (Frankfurt)
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+
+def _redact(text: str, *secrets: str) -> str:
+    for s in secrets:
+        if s:
+            text = text.replace(s, "[REDACTED]")
+    return text
+
+
+def _call_qwen(prompt: str) -> dict:
+    api_key = _get_secret("DASHSCOPE_API_KEY")
+    workspace_id = _get_secret("DASHSCOPE_WORKSPACE_ID")
+    if not api_key or not workspace_id:
+        raise RuntimeError("Qwen not configured (DASHSCOPE_API_KEY / DASHSCOPE_WORKSPACE_ID missing)")
+
+    client = OpenAI(api_key=api_key, base_url=f"https://{workspace_id}.{QWEN_REGION_HOST}/compatible-mode/v1")
+    try:
+        response = client.chat.completions.create(
+            model=QWEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+            extra_body={"enable_thinking": False},  # flash is extraction/matching, not reasoning
+        )
+        content = response.choices[0].message.content
+    except Exception as e:
+        raise RuntimeError(_redact(str(e), api_key)) from e
+
+    result = json.loads(content)  # JSONDecodeError also triggers call_llm()'s fallback
+    if not isinstance(result, dict):
+        raise ValueError("Qwen response was not a JSON object")
+    return result
+
+
+def _call_groq(prompt: str) -> dict:
+    api_key = _get_secret("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("Groq not configured (GROQ_API_KEY missing)")
+
+    client = Groq(api_key=api_key)
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        content = response.choices[0].message.content
+    except Exception as e:
+        raise RuntimeError(_redact(str(e), api_key)) from e
+
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        raise ValueError("Groq response was not a JSON object")
+    return result
+
+
+def call_llm(prompt: str) -> dict:
+    """Sends prompt to Qwen first, falling back to Groq if Qwen fails for any reason.
+    Records which provider actually handled the call in
+    st.session_state['llm_providers_used'] (a list the UI can inspect after a batch of
+    calls to show a small "fallback used" note) — reset that list before starting a
+    user-facing operation if you want an accurate per-operation view."""
+    errors = []
+    for name, fn in (("qwen", _call_qwen), ("groq", _call_groq)):
+        try:
+            result = fn(prompt)
+            try:
+                st.session_state.setdefault("llm_providers_used", []).append(name)
+            except Exception:
+                pass
+            return result
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+
+    raise RuntimeError(
+        "Both AI providers failed or are not configured:\n" + "\n".join(errors)
+    )
 
 
 def parse_job(text: str, url: str) -> dict:
-    client = Groq(api_key=get_groq_key())
     prompt = f"""Extract structured information from this job posting.
 Return ONLY a JSON object — no markdown, no explanation — with exactly these fields:
 
@@ -162,13 +252,7 @@ Job URL: {url}
 Job text:
 {text}"""
 
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0,
-    )
-    result = json.loads(response.choices[0].message.content)
+    result = call_llm(prompt)
     result["key_skills"] = format_bullets(result.get("key_skills", ""))
     result["comments"]   = format_bullets(result.get("comments", ""))
     return result
@@ -177,7 +261,6 @@ Job text:
 JOBS_LIST_CHAR_BUDGET = 12000  # keeps the prompt well under Groq's per-minute token limit
 
 def parse_email(email_text: str, jobs: list) -> dict:
-    client = Groq(api_key=get_groq_key())
     # Sending every job can exceed the model's per-minute token budget once the sheet
     # grows large (each row costs real tokens). Email updates are almost always about
     # recent applications, so cap the candidate list to the most recent ones that fit
@@ -222,13 +305,7 @@ Return ONLY a JSON object with these fields:
   "new_application_confidence": "<high, medium, or low — ONLY relevant when is_new_application_confirmation is true and matched_row is null: how confident are you this is a genuinely new, not-yet-tracked application, based on how clearly the company, role, and date are stated in the email>"
 }}"""
 
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0,
-    )
-    result = json.loads(response.choices[0].message.content)
+    result = call_llm(prompt)
     result["company_comments"] = format_bullets(result.get("company_comments", ""))
     return result
 
@@ -276,8 +353,6 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
 def match_job(parsed: dict, profile: str) -> dict:
     """Compare parsed job against the career profile. Returns match_level (0-100),
     match_summary, and missing_skills."""
-    client = Groq(api_key=get_groq_key())
-
     job_snapshot = (
         f"Role: {parsed.get('role', '')}\n"
         f"Company: {parsed.get('company', '')}\n"
@@ -286,10 +361,13 @@ def match_job(parsed: dict, profile: str) -> dict:
         f"Comments / requirements:\n{parsed.get('comments', '')}"
     )
 
+    # No arbitrary truncation: the profile is a few thousand characters (well under
+    # any provider's context window), and match accuracy matters more than the
+    # negligible token-cost difference of sending it in full.
     prompt = f"""You are a career advisor performing a job-fit analysis.
 
 CANDIDATE PROFILE:
-{profile[:7000]}
+{profile}
 
 JOB POSTING:
 {job_snapshot}
@@ -301,13 +379,7 @@ Analyse how well the candidate fits this job and return ONLY a JSON object:
   "missing_skills": "<skills or requirements from the job the candidate clearly lacks — one per line starting with •. Write None if there are no gaps.>"
 }}"""
 
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0,
-    )
-    result = json.loads(response.choices[0].message.content)
+    result = call_llm(prompt)
     result["missing_skills"] = format_bullets(result.get("missing_skills", ""))
     return result
 
@@ -689,6 +761,8 @@ def main():
                 st.warning("Enter a URL or paste the job description.")
                 st.stop()
 
+            st.session_state["llm_providers_used"] = []  # reset before this batch of AI calls
+
             with st.spinner("Parsing with AI..."):
                 try:
                     parsed = parse_job(text, url.strip() or "")
@@ -713,6 +787,8 @@ def main():
                         st.session_state["match_result"] = match
                     except Exception as e:
                         st.session_state["match_error"] = str(e)
+
+            st.session_state["parse_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
 
             # Duplicate check
             with st.spinner("Checking for duplicates..."):
@@ -745,6 +821,8 @@ def main():
                 )
 
             st.subheader("Review & Edit")
+            if st.session_state.get("parse_used_fallback"):
+                st.caption("⚙️ Qwen was unavailable for this request — used Groq fallback.")
 
             # ── Match display ─────────────────────────────────────────────────
             match = st.session_state.get("match_result", {})
@@ -915,11 +993,14 @@ def main():
                     st.error(f"Could not load sheet: {e}")
                     st.stop()
 
+            st.session_state["llm_providers_used"] = []  # reset before this AI call
+
             with st.spinner("Parsing email with AI..."):
                 try:
                     result = parse_email(email_text.strip(), jobs)
                     st.session_state["email_parsed"] = result
                     st.session_state["email_jobs"] = jobs
+                    st.session_state["email_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
                 except Exception as e:
                     st.error(f"Parsing failed: {e}")
                     st.stop()
@@ -930,6 +1011,8 @@ def main():
 
             st.divider()
             st.subheader("Review & Apply Update")
+            if st.session_state.get("email_used_fallback"):
+                st.caption("⚙️ Qwen was unavailable for this request — used Groq fallback.")
 
             matched_row = r.get("matched_row")
             ai_is_new_app = r.get("is_new_application_confirmation", False)
