@@ -69,7 +69,7 @@ and everything else works as normal.
 streamlit run app.py
 ```
 
-Opens at `http://localhost:8501`
+Opens at `http://localhost:8501` — you'll hit a password prompt first, see [Password gate](#password-gate) below.
 
 ---
 
