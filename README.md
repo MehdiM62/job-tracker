@@ -29,9 +29,9 @@ pip install -r requirements.txt
 ### 2. Get an Alibaba Cloud Model Studio (Qwen) API key — primary provider
 
 1. Go to the [Alibaba Cloud Model Studio console](https://www.alibabacloud.com/help/en/model-studio/first-api-call-to-qwen) and create/sign in to an account
-2. Make sure your workspace's region is set to **Germany (Frankfurt)** — this app calls the EU/Frankfurt endpoint specifically
-3. Create an API key in that workspace — it starts with `sk-...`
-4. Note your **Workspace ID** too (shown on the workspace details page) — the Frankfurt endpoint requires it as part of the URL, unlike some other regions
+2. **Before creating a key**, explicitly switch your workspace's region to **Germany (Frankfurt)** — do this first. Model Studio defaults new workspaces to the Singapore/International region, whose API Keys page shows a base URL like `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. That's a *different region* from Frankfurt: per Alibaba's docs, "each region has its own access domain, API Key, and model list — these cannot be used across regions," so a key created without switching first will silently be Singapore-scoped and won't work against this app's Frankfurt endpoint (and your data won't get EU processing either)
+3. Create an API key in the Frankfurt workspace — it starts with `sk-...`. Its API Keys page should now show a workspace-dedicated base URL under `eu-central-1`, not `dashscope-intl`
+4. Note your **Workspace ID** too (shown on the workspace details page) — the Frankfurt endpoint requires it embedded in the URL, unlike the Singapore/`dashscope-intl` one
 5. Enable pay-as-you-go billing for `qwen3.5-flash` if prompted
 
 ### 2b. (Recommended) Get a Groq API key — automatic fallback
