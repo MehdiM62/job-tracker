@@ -8,7 +8,7 @@ A Streamlit web app that extracts job details from any URL using AI and saves th
 - Optional job-fit matching against your career profile (Match Level + Missing Skills)
 - Source dropdown auto-detected from the URL, with an "Other" option for custom sources
 - CV Language toggle (EN / DE)
-- Date Applied auto-set to current CET time
+- Date Applied auto-set to current CET time, editable if you're backfilling a past application — the sheet stays sorted by date, inserting the row in the right place and renumbering No. automatically
 - Editable review form before saving
 - Writes directly to your Google Sheet
 - **Update from Email** tab: paste a recruiter/company email and the AI matches it to an

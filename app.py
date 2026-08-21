@@ -460,29 +460,59 @@ def normalize_sheet_formatting(ws) -> dict:
 
 
 def append_job(data: dict) -> int:
+    """Inserts the job at the sheet position that keeps Date Applied ascending —
+    appends at the bottom if the date is newest (the common case), otherwise inserts
+    in the middle and renumbers every row pushed down so No. stays sequential."""
     ws = get_worksheet()
     ensure_extra_cols(ws)
     all_rows = ws.get_all_values()
     data_rows = [r for r in all_rows[1:] if any(cell.strip() for cell in r)]
-    next_no = len(data_rows) + 1
-    now_cet = datetime.now(CET).strftime("%Y-%m-%d %H:%M")
+    total_existing = len(data_rows)
+
+    date_str = data.get("date_applied") or datetime.now(CET).strftime("%Y-%m-%d %H:%M")
+    try:
+        new_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+    except ValueError:
+        date_str = datetime.now(CET).strftime("%Y-%m-%d %H:%M")
+        new_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+
+    insert_idx = total_existing
+    for i, row in enumerate(data_rows):
+        try:
+            existing_dt = datetime.strptime(row[1], "%Y-%m-%d %H:%M")
+        except (ValueError, IndexError):
+            continue
+        if new_dt < existing_dt:
+            insert_idx = i
+            break
+
+    new_no = insert_idx + 1
+    sheet_row = insert_idx + 2  # +1 for header, +1 for 1-indexing
+
     ml = data.get("match_level", "")
     match_display = f"{ml}%" if isinstance(ml, int) else str(ml)
-    ws.append_row(
-        [
-            next_no, now_cet,
-            data["company"], data["role"], data["city"],
-            data["language_req"], data["key_skills"], data["contact_person"],
-            data["url"], data["status"], data["comments"], data["cv_lang"],
-            data.get("source", ""),          # M — Source
-            "",                              # N — Company Comments
-            match_display,                   # O — Match Level
-            data.get("missing_skills", ""),  # P — Missing Skills
-        ],
-        value_input_option="USER_ENTERED",
-    )
-    format_row(ws, next_no + 1, [data["key_skills"], data["comments"], data.get("missing_skills", "")])
-    return next_no
+    row_values = [
+        new_no, date_str,
+        data["company"], data["role"], data["city"],
+        data["language_req"], data["key_skills"], data["contact_person"],
+        data["url"], data["status"], data["comments"], data["cv_lang"],
+        data.get("source", ""),          # M — Source
+        "",                              # N — Company Comments
+        match_display,                   # O — Match Level
+        data.get("missing_skills", ""),  # P — Missing Skills
+    ]
+
+    if insert_idx == total_existing:
+        ws.append_row(row_values, value_input_option="USER_ENTERED")
+    else:
+        ws.insert_row(row_values, sheet_row, value_input_option="USER_ENTERED", inherit_from_before=True)
+        renumber_range = f"A{sheet_row + 1}:A{sheet_row + (total_existing - insert_idx)}"
+        bumped = [[str(int(r[0]) + 1)] for r in ws.get(renumber_range) if r and r[0].strip().isdigit()]
+        if bumped:
+            ws.update(bumped, renumber_range, value_input_option="RAW")
+
+    format_row(ws, sheet_row, [data["key_skills"], data["comments"], data.get("missing_skills", "")])
+    return new_no
 
 
 def update_job_from_email(row_no: int, new_status: str, company_comments: str, email_date: str) -> bool:
@@ -733,8 +763,6 @@ def main():
             elif st.session_state.get("match_error"):
                 st.warning(f"⚠️ Matching failed: {st.session_state['match_error']}")
 
-            st.info(f"📅 Date Applied (CET): **{datetime.now(CET).strftime('%Y-%m-%d %H:%M')}**")
-
             # Detect source from URL; fall back to last used source
             _job_url = st.session_state.get("job_url", "")
             _detected = detect_source(_job_url)
@@ -778,6 +806,13 @@ def main():
                         horizontal=True,
                     )
 
+                date_applied = st.text_input(
+                    "Date Applied (CET)",
+                    value=datetime.now(CET).strftime("%Y-%m-%d %H:%M"),
+                    help="Format: YYYY-MM-DD HH:MM. Backdating inserts the row in date "
+                         "order and renumbers the rows below it — leave as-is for 'now'.",
+                )
+
                 contact    = st.text_input("Contact Person", value=p.get("contact_person", "Not specified"))
                 key_skills = st.text_area("Key Skills Required", value=p.get("key_skills", ""), height=180)
                 comments   = st.text_area("Comments", value=p.get("comments", ""), height=130)
@@ -800,6 +835,11 @@ def main():
                     )
 
             if submitted:
+                try:
+                    datetime.strptime(date_applied.strip(), "%Y-%m-%d %H:%M")
+                except ValueError:
+                    st.error("Date Applied must be in YYYY-MM-DD HH:MM format.")
+                    st.stop()
                 with st.spinner("Saving to Google Sheet..."):
                     try:
                         row_no = append_job({
@@ -810,6 +850,7 @@ def main():
                             "cv_lang": cv_edit, "source": source,
                             "match_level": match.get("match_level", "") if match else "",
                             "missing_skills": missing_skills,
+                            "date_applied": date_applied.strip(),
                         })
                         st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
                         st.session_state["cv_lang"] = cv_edit
