@@ -241,21 +241,34 @@ def normalize_company(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name)
 
 
-def fuzzy_find_job(matched_company: str, jobs: list):
-    """Deterministic backstop for when the AI can't confidently match a row (e.g. the
-    company is only identifiable via the sender's email domain, which this model
-    doesn't infer reliably every time). Normalizes company names and checks for a
-    substring match against the FULL job history, not just the truncated AI candidate
-    list — cheap and local, no extra API call. Requires a minimum length and a single
-    unambiguous candidate, since short names (e.g. "SAP") risk false substring matches
-    (e.g. "Sapient") and a wrong specific suggestion is worse than admitting no match."""
-    target = normalize_company(matched_company or "")
-    if len(target) < 4:
+def normalize_role(role: str) -> str:
+    role = role.lower()
+    role = re.sub(r"\([^)]*\)", "", role)  # strip gender/diversity tags like "(w/m/d)"
+    return re.sub(r"[^a-z0-9]", "", role)
+
+
+def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
+    """Deterministic backstop for when the AI can't confidently match a row — e.g. the
+    company is only identifiable via the sender's email domain (which this model doesn't
+    infer reliably every time), or the row is outside the truncated candidate list sent
+    to the AI (a genuine duplicate of an old application). Checks the FULL job history,
+    not just the truncated list — cheap and local, no extra API call.
+
+    Requires BOTH company and role to reasonably match, not company alone: a company can
+    have several separate tracked applications (a different role, an old rejected
+    attempt), and matching on company name only would silently point at the wrong one.
+    Also requires a minimum length and a single unambiguous candidate, since short names
+    (e.g. "SAP") risk false substring matches (e.g. "Sapient")."""
+    target_co = normalize_company(matched_company or "")
+    target_role = normalize_role(matched_role or "")
+    if len(target_co) < 4 or len(target_role) < 4:
         return None
-    candidates = [
-        j.get("No.") for j in jobs
-        if (c := normalize_company(str(j.get("Company", "")))) and (target in c or c in target)
-    ]
+    candidates = []
+    for j in jobs:
+        co = normalize_company(str(j.get("Company", "")))
+        role = normalize_role(str(j.get("Role", "")))
+        if co and role and (target_co in co or co in target_co) and (target_role in role or role in target_role):
+            candidates.append(j.get("No."))
     unique_rows = set(candidates)
     return candidates[0] if len(unique_rows) == 1 else None
 
@@ -921,13 +934,12 @@ def main():
             matched_row = r.get("matched_row")
             ai_is_new_app = r.get("is_new_application_confirmation", False)
 
-            # Don't trust a fuzzy company-only match when the AI thinks this is a brand
-            # new application — the company may already have OTHER, unrelated rows
-            # tracked (a different role, a past rejected attempt, etc.), and matching on
-            # company name alone would silently point at the wrong one.
+            # Always worth trying — it requires company AND role to match, so it safely
+            # catches a genuine duplicate the AI missed (e.g. a row outside the truncated
+            # candidate list) without misfiling a different role at the same company.
             fuzzy_matched = False
-            if matched_row is None and not ai_is_new_app:
-                matched_row = fuzzy_find_job(r.get("matched_company", ""), jobs)
+            if matched_row is None:
+                matched_row = fuzzy_find_job(r.get("matched_company", ""), r.get("matched_role", ""), jobs)
                 fuzzy_matched = matched_row is not None
 
             ADD_NEW_LABEL = "➕ Add as a new application (not in the sheet)"
