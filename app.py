@@ -919,22 +919,65 @@ def main():
             st.subheader("Review & Apply Update")
 
             matched_row = r.get("matched_row")
+            ai_is_new_app = r.get("is_new_application_confirmation", False)
+
+            # Don't trust a fuzzy company-only match when the AI thinks this is a brand
+            # new application — the company may already have OTHER, unrelated rows
+            # tracked (a different role, a past rejected attempt, etc.), and matching on
+            # company name alone would silently point at the wrong one.
             fuzzy_matched = False
-            if matched_row is None:
+            if matched_row is None and not ai_is_new_app:
                 matched_row = fuzzy_find_job(r.get("matched_company", ""), jobs)
                 fuzzy_matched = matched_row is not None
 
-            is_new_app = matched_row is None and r.get("is_new_application_confirmation", False)
+            ADD_NEW_LABEL = "➕ Add as a new application (not in the sheet)"
+            job_options = {
+                f"Row {j.get('No.')} — {j.get('Company')} | {j.get('Role')} | {j.get('Status')}": j.get("No.")
+                for j in jobs
+            }
+            options_list = [ADD_NEW_LABEL] + list(job_options.keys())
 
-            if is_new_app:
-                # ── New, not-yet-tracked application: offer to add it instead of updating ──
+            if matched_row is None:
+                default_idx = 0 if ai_is_new_app else 1
+            else:
+                default_idx = 1
+                for i, no in enumerate(job_options.values()):
+                    if no == matched_row:
+                        default_idx = i + 1  # +1 for the "Add as new" option at index 0
+                        break
+
+            if fuzzy_matched:
+                st.info(
+                    f"🔎 AI wasn't sure, but found Row {matched_row} by matching the company name "
+                    f"**{r.get('matched_company', '')}** — please confirm it's correct below, or pick "
+                    f"\"{ADD_NEW_LABEL}\" if this is actually a different/new application."
+                )
+            elif matched_row is not None:
+                confidence = r.get("confidence", "low")
+                conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "🔴")
+                st.caption(f"Match confidence: {conf_color} **{confidence.upper()}**")
+            elif ai_is_new_app:
                 conf = r.get("new_application_confidence", "low")
                 conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(conf, "🔴")
                 st.info(
                     f"📥 This looks like a confirmation for a **new application not yet in your sheet**.\n\n"
                     f"Confidence this is genuinely untracked: {conf_color} **{conf.upper()}**"
                 )
+            else:
+                st.warning(
+                    f"⚠️ No matching application found for **{r.get('matched_company', 'this company')} — "
+                    f"{r.get('matched_role', 'this role')}**. It may not be tracked yet, or falls outside "
+                    f"the recent-applications window sent to the AI — select the correct row below, or "
+                    f"add it as a new application if it's missing entirely."
+                )
 
+            selected_label = st.selectbox(
+                "Which job does this email refer to?",
+                options_list,
+                index=default_idx,
+            )
+
+            if selected_label == ADD_NEW_LABEL:
                 with st.form("add_from_email_form"):
                     c1, c2 = st.columns(2)
                     with c1:
@@ -980,39 +1023,6 @@ def main():
                             st.error(f"Failed to add: {e}")
 
             else:
-                if fuzzy_matched:
-                    st.info(
-                        f"🔎 AI wasn't sure, but found Row {matched_row} by matching the company name "
-                        f"**{r.get('matched_company', '')}** — please confirm it's correct below."
-                    )
-                elif matched_row is None:
-                    st.warning(
-                        f"⚠️ No matching application found for **{r.get('matched_company', 'this company')} — "
-                        f"{r.get('matched_role', 'this role')}**. It may not be tracked yet, or falls outside "
-                        f"the recent-applications window sent to the AI — select the correct row below, or "
-                        f"add it as a new job first (Add Job tab) if it's missing entirely."
-                    )
-                else:
-                    confidence = r.get("confidence", "low")
-                    conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "🔴")
-                    st.caption(f"Match confidence: {conf_color} **{confidence.upper()}**")
-
-                # Job selector — pre-select what AI found, let user override
-                job_options = {
-                    f"Row {j.get('No.')} — {j.get('Company')} | {j.get('Role')} | {j.get('Status')}": j.get("No.")
-                    for j in jobs
-                }
-                default_idx = 0
-                for i, no in enumerate(job_options.values()):
-                    if no == matched_row:
-                        default_idx = i
-                        break
-
-                selected_label = st.selectbox(
-                    "Which job does this email refer to?",
-                    list(job_options.keys()),
-                    index=default_idx,
-                )
                 selected_row_no = job_options[selected_label]
 
                 with st.form("email_form"):
