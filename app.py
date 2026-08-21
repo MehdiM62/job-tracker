@@ -569,7 +569,11 @@ def main():
         st.success(st.session_state.pop("success_msg"))
         st.balloons()
 
-    tab_add, tab_email = st.tabs(["➕ Add Job", "📧 Update from Email"])
+    # A key makes the active tab a stateful widget tracked in session_state — without
+    # one, Streamlit relies on fragile client-side-only memory to keep the same tab
+    # selected across reruns, which intermittently resets to the first tab (e.g. right
+    # after the "Parse Email" button triggers a rerun mid-spinner).
+    tab_add, tab_email = st.tabs(["➕ Add Job", "📧 Update from Email"], key="active_tab")
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 1 — Add Job
