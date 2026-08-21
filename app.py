@@ -212,10 +212,14 @@ Return ONLY a JSON object with these fields:
   "matched_row": <row number as integer, or null if unclear>,
   "matched_company": "<company name from the email>",
   "matched_role": "<role/position from the email>",
+  "contact_person": "<recruiter/HR name, phone, email from the signature — otherwise 'Not specified'>",
   "email_date": "<date the email was sent/received, YYYY-MM-DD format — read it from the email's own date/header/signature, not today's date>",
+  "email_datetime": "<the email's own date AND time, YYYY-MM-DD HH:MM format (24h) — used only if this becomes a brand-new sheet row>",
   "new_status": "<updated status — one of: Applied, Interview, Assessment, Offer, Rejected, Withdrawn>",
   "company_comments": "<concise summary of what THIS email says, one point per line starting with •\\n — do not include the email date, it is recorded separately, e.g.: • Interview invite: 2026-08-14 10:00 via Teams\\n• Next round: technical interview\\n• Rejection reason: overqualified>",
-  "confidence": "<high, medium, or low — confidence that matched_row is the CORRECT row in the applied jobs list above. If matched_row is null, this must be low, even if you're sure about the company/role from the email itself>"
+  "confidence": "<high, medium, or low — confidence that matched_row is the CORRECT row in the applied jobs list above. If matched_row is null, this must be low, even if you're sure about the company/role from the email itself>",
+  "is_new_application_confirmation": <true/false — true only if this is an acknowledgment that a NEW application was just received (e.g. "Eingangsbestätigung", "we received your application", "thank you for applying"), not a status update on something already in progress>,
+  "new_application_confidence": "<high, medium, or low — ONLY relevant when is_new_application_confirmation is true and matched_row is null: how confident are you this is a genuinely new, not-yet-tracked application, based on how clearly the company, role, and date are stated in the email>"
 }}"""
 
     response = client.chat.completions.create(
@@ -920,77 +924,133 @@ def main():
                 matched_row = fuzzy_find_job(r.get("matched_company", ""), jobs)
                 fuzzy_matched = matched_row is not None
 
-            if fuzzy_matched:
+            is_new_app = matched_row is None and r.get("is_new_application_confirmation", False)
+
+            if is_new_app:
+                # ── New, not-yet-tracked application: offer to add it instead of updating ──
+                conf = r.get("new_application_confidence", "low")
+                conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(conf, "🔴")
                 st.info(
-                    f"🔎 AI wasn't sure, but found Row {matched_row} by matching the company name "
-                    f"**{r.get('matched_company', '')}** — please confirm it's correct below."
+                    f"📥 This looks like a confirmation for a **new application not yet in your sheet**.\n\n"
+                    f"Confidence this is genuinely untracked: {conf_color} **{conf.upper()}**"
                 )
-            elif matched_row is None:
-                st.warning(
-                    f"⚠️ No matching application found for **{r.get('matched_company', 'this company')} — "
-                    f"{r.get('matched_role', 'this role')}**. It may not be tracked yet, or falls outside "
-                    f"the recent-applications window sent to the AI — select the correct row below, or "
-                    f"add it as a new job first (Add Job tab) if it's missing entirely."
-                )
-            else:
-                confidence = r.get("confidence", "low")
-                conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "🔴")
-                st.caption(f"Match confidence: {conf_color} **{confidence.upper()}**")
 
-            # Job selector — pre-select what AI found, let user override
-            job_options = {
-                f"Row {j.get('No.')} — {j.get('Company')} | {j.get('Role')} | {j.get('Status')}": j.get("No.")
-                for j in jobs
-            }
-            default_idx = 0
-            for i, no in enumerate(job_options.values()):
-                if no == matched_row:
-                    default_idx = i
-                    break
+                with st.form("add_from_email_form"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        new_company = st.text_input("Company", value=r.get("matched_company", ""))
+                        new_date = st.text_input(
+                            "Date Applied (CET)", value=r.get("email_datetime", ""),
+                            help="Format: YYYY-MM-DD HH:MM — from the email's own date/time.",
+                        )
+                    with c2:
+                        new_role = st.text_input("Role", value=r.get("matched_role", ""))
+                        new_contact = st.text_input("Contact Person", value=r.get("contact_person", "Not specified"))
 
-            selected_label = st.selectbox(
-                "Which job does this email refer to?",
-                list(job_options.keys()),
-                index=default_idx,
-            )
-            selected_row_no = job_options[selected_label]
-
-            with st.form("email_form"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    email_date = st.text_input("Email date", value=r.get("email_date", ""))
-                with c2:
-                    new_status = st.selectbox(
-                        "New status",
-                        STATUSES,
-                        index=STATUSES.index(r.get("new_status", "Applied"))
-                        if r.get("new_status") in STATUSES else 0,
+                    new_comments = st.text_area(
+                        "Comments", value=r.get("company_comments", ""), height=120,
                     )
 
-                company_comments = st.text_area(
-                    "Company Comments (will be appended to sheet)",
-                    value=r.get("company_comments", ""),
-                    height=200,
-                )
+                    add_btn = st.form_submit_button(
+                        "➕ Add to Google Sheet", type="primary", use_container_width=True,
+                    )
 
-                apply_btn = st.form_submit_button("✅ Update Sheet", type="primary", use_container_width=True)
-
-            if apply_btn:
-                with st.spinner("Updating sheet..."):
+                if add_btn:
                     try:
-                        ok = update_job_from_email(selected_row_no, new_status, company_comments, email_date)
-                        if ok:
-                            st.session_state["success_msg"] = (
-                                f"✅ Row #{selected_row_no} updated — Status: {new_status}"
-                            )
+                        datetime.strptime(new_date.strip(), "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        st.error("Date Applied must be in YYYY-MM-DD HH:MM format.")
+                        st.stop()
+                    with st.spinner("Adding to Google Sheet..."):
+                        try:
+                            row_no = append_job({
+                                "company": new_company, "role": new_role, "city": "",
+                                "language_req": "", "key_skills": "", "contact_person": new_contact,
+                                "url": "", "status": "Applied", "comments": new_comments,
+                                "cv_lang": st.session_state.get("cv_lang", "EN"), "source": "Other",
+                                "match_level": "", "missing_skills": "",
+                                "date_applied": new_date.strip(),
+                            })
+                            st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
                             st.session_state.pop("email_parsed", None)
                             st.session_state.pop("email_jobs", None)
-                            st.session_state["email_key"] += 1  # clears email text area
+                            st.session_state["email_key"] += 1
                             st.rerun()
-                        else:
-                            st.error(f"Row #{selected_row_no} not found in the sheet.")
-                    except Exception as e:
-                        st.error(f"Failed to update sheet: {e}")
+                        except Exception as e:
+                            st.error(f"Failed to add: {e}")
+
+            else:
+                if fuzzy_matched:
+                    st.info(
+                        f"🔎 AI wasn't sure, but found Row {matched_row} by matching the company name "
+                        f"**{r.get('matched_company', '')}** — please confirm it's correct below."
+                    )
+                elif matched_row is None:
+                    st.warning(
+                        f"⚠️ No matching application found for **{r.get('matched_company', 'this company')} — "
+                        f"{r.get('matched_role', 'this role')}**. It may not be tracked yet, or falls outside "
+                        f"the recent-applications window sent to the AI — select the correct row below, or "
+                        f"add it as a new job first (Add Job tab) if it's missing entirely."
+                    )
+                else:
+                    confidence = r.get("confidence", "low")
+                    conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "🔴")
+                    st.caption(f"Match confidence: {conf_color} **{confidence.upper()}**")
+
+                # Job selector — pre-select what AI found, let user override
+                job_options = {
+                    f"Row {j.get('No.')} — {j.get('Company')} | {j.get('Role')} | {j.get('Status')}": j.get("No.")
+                    for j in jobs
+                }
+                default_idx = 0
+                for i, no in enumerate(job_options.values()):
+                    if no == matched_row:
+                        default_idx = i
+                        break
+
+                selected_label = st.selectbox(
+                    "Which job does this email refer to?",
+                    list(job_options.keys()),
+                    index=default_idx,
+                )
+                selected_row_no = job_options[selected_label]
+
+                with st.form("email_form"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        email_date = st.text_input("Email date", value=r.get("email_date", ""))
+                    with c2:
+                        new_status = st.selectbox(
+                            "New status",
+                            STATUSES,
+                            index=STATUSES.index(r.get("new_status", "Applied"))
+                            if r.get("new_status") in STATUSES else 0,
+                        )
+
+                    company_comments = st.text_area(
+                        "Company Comments (will be appended to sheet)",
+                        value=r.get("company_comments", ""),
+                        height=200,
+                    )
+
+                    apply_btn = st.form_submit_button("✅ Update Sheet", type="primary", use_container_width=True)
+
+                if apply_btn:
+                    with st.spinner("Updating sheet..."):
+                        try:
+                            ok = update_job_from_email(selected_row_no, new_status, company_comments, email_date)
+                            if ok:
+                                st.session_state["success_msg"] = (
+                                    f"✅ Row #{selected_row_no} updated — Status: {new_status}"
+                                )
+                                st.session_state.pop("email_parsed", None)
+                                st.session_state.pop("email_jobs", None)
+                                st.session_state["email_key"] += 1  # clears email text area
+                                st.rerun()
+                            else:
+                                st.error(f"Row #{selected_row_no} not found in the sheet.")
+                        except Exception as e:
+                            st.error(f"Failed to update sheet: {e}")
 
 
 if __name__ == "__main__":
