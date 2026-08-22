@@ -143,15 +143,26 @@ def _get_secret(name: str) -> str:
 
 
 # ── LLM provider abstraction ────────────────────────────────────────────────
-# Qwen3.5-Flash (Alibaba Cloud Model Studio, EU/Frankfurt) is the primary provider
+# Qwen3.5-Flash (via QwenCloud's OpenAI-compatible endpoint) is the primary provider
 # for all AI calls; Groq (GPT-OSS-120B) is an automatic fallback if Qwen fails for
 # any reason (not configured, timeout, rate limit, API error, or a malformed/
 # non-JSON response). Both providers get the exact same prompt — call_llm() is the
 # single place that knows about providers, so parse_job/parse_email/match_job stay
 # provider-agnostic and their JSON schemas are untouched.
+#
+# NOTE on data residency: this endpoint (dashscope-intl.aliyuncs.com) is Alibaba
+# Cloud's Singapore/International region — NOT the EU/Frankfurt region. An earlier
+# attempt used the Frankfurt-specific workspace-scoped endpoint
+# (`{workspace_id}.eu-central-1.maas.aliyuncs.com`), which is the correct one for
+# EU data residency, but that Model Studio workspace hit an account-level
+# "AccessDenied.Unpurchased" restriction that didn't get resolved. This switch to
+# QwenCloud's direct dashscope-intl endpoint was a deliberate choice to get a
+# working setup — if EU-only processing becomes a hard requirement again, the fix
+# is a Frankfurt-region API key + workspace ID, not a code change (see git history
+# for the previous eu-central-1 implementation).
 
 QWEN_MODEL = "qwen3.5-flash"
-QWEN_REGION_HOST = "eu-central-1.maas.aliyuncs.com"  # Model Studio Germany (Frankfurt)
+QWEN_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"  # Singapore/International
 GROQ_MODEL = "openai/gpt-oss-120b"
 
 
@@ -164,11 +175,10 @@ def _redact(text: str, *secrets: str) -> str:
 
 def _call_qwen(prompt: str) -> dict:
     api_key = _get_secret("DASHSCOPE_API_KEY")
-    workspace_id = _get_secret("DASHSCOPE_WORKSPACE_ID")
-    if not api_key or not workspace_id:
-        raise RuntimeError("Qwen not configured (DASHSCOPE_API_KEY / DASHSCOPE_WORKSPACE_ID missing)")
+    if not api_key:
+        raise RuntimeError("Qwen not configured (DASHSCOPE_API_KEY missing)")
 
-    client = OpenAI(api_key=api_key, base_url=f"https://{workspace_id}.{QWEN_REGION_HOST}/compatible-mode/v1")
+    client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
     try:
         response = client.chat.completions.create(
             model=QWEN_MODEL,

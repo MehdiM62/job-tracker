@@ -3,7 +3,7 @@
 A Streamlit web app that extracts job details from any URL using AI and saves them to a Google Sheet.
 
 **Features**
-- Paste any job URL → AI (Qwen3.5-Flash via Alibaba Cloud Model Studio, EU/Frankfurt — with an automatic Groq fallback) extracts company, role, city, skills, contact, and more
+- Paste any job URL → AI (Qwen3.5-Flash via QwenCloud — with an automatic Groq fallback) extracts company, role, city, skills, contact, and more
 - Falls back to manual paste for sites that block scrapers (LinkedIn, etc.)
 - Optional job-fit matching against your career profile (Match Level + Missing Skills)
 - Source dropdown auto-detected from the URL, with an "Other" option for custom sources
@@ -26,13 +26,11 @@ A Streamlit web app that extracts job details from any URL using AI and saves th
 pip install -r requirements.txt
 ```
 
-### 2. Get an Alibaba Cloud Model Studio (Qwen) API key — primary provider
+### 2. Get a Qwen API key — primary provider
 
-1. Go to the [Alibaba Cloud Model Studio console](https://www.alibabacloud.com/help/en/model-studio/first-api-call-to-qwen) and create/sign in to an account
-2. **Before creating a key**, explicitly switch your workspace's region to **Germany (Frankfurt)** — do this first. Model Studio defaults new workspaces to the Singapore/International region, whose API Keys page shows a base URL like `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. That's a *different region* from Frankfurt: per Alibaba's docs, "each region has its own access domain, API Key, and model list — these cannot be used across regions," so a key created without switching first will silently be Singapore-scoped and won't work against this app's Frankfurt endpoint (and your data won't get EU processing either)
-3. Create an API key in the Frankfurt workspace — it starts with `sk-...`. Its API Keys page should now show a workspace-dedicated base URL under `eu-central-1`, not `dashscope-intl`
-4. Note your **Workspace ID** too (shown on the workspace details page) — the Frankfurt endpoint requires it embedded in the URL, unlike the Singapore/`dashscope-intl` one
-5. Enable pay-as-you-go billing for `qwen3.5-flash` if prompted
+1. Get an API key for `qwen3.5-flash` from [QwenCloud](https://www.qwencloud.com) (or the [Alibaba Cloud Model Studio console](https://www.alibabacloud.com/help/en/model-studio/first-api-call-to-qwen), which issues keys for the same backend) — it starts with `sk-...`
+2. Make sure the account has completed whatever eligibility/billing step Alibaba requires before API calls succeed — a key that authenticates but returns `403 AccessDenied.Unpurchased` on every model means this step isn't done yet (check the console for a "Some Features Restricted" banner or similar) — this is an account-level gate, not something this app's code can work around
+3. This app calls the **Singapore/International** endpoint (`dashscope-intl.aliyuncs.com`) — see the note in [AI provider & fallback](#ai-provider--fallback) below if you specifically need EU/Frankfurt data residency instead, which requires a different key and a small code change (a Frankfurt-region Model Studio workspace, not a QwenCloud key)
 
 ### 2b. (Recommended) Get a Groq API key — automatic fallback
 
@@ -58,13 +56,12 @@ has nowhere to fall back to.
 
 ```bash
 cp .env.example .env
-# Edit .env and add your DASHSCOPE_API_KEY, DASHSCOPE_WORKSPACE_ID, and (recommended) GROQ_API_KEY
+# Edit .env and add your DASHSCOPE_API_KEY and (recommended) GROQ_API_KEY
 ```
 
 Your `.env` should look like:
 ```
 DASHSCOPE_API_KEY=sk-...
-DASHSCOPE_WORKSPACE_ID=your-workspace-id
 GROQ_API_KEY=gsk_...
 GOOGLE_CREDENTIALS_FILE=credentials.json
 ```
@@ -106,21 +103,30 @@ the `?pw=...` part) asks for the password again.
 
 All three AI operations (parsing a job posting, matching it against your career profile,
 and parsing an email) go through one shared function that always tries **Qwen3.5-Flash**
-(Alibaba Cloud Model Studio, EU/Frankfurt) first, and automatically falls back to
-**Groq (GPT-OSS-120B)** if Qwen fails for any reason — not configured, timeout, rate limit,
-API error, or an invalid/non-JSON response. Both providers receive the exact same prompt,
-so results stay consistent regardless of which one actually answered.
+first, and automatically falls back to **Groq (GPT-OSS-120B)** if Qwen fails for any reason
+— not configured, timeout, rate limit, API error, or an invalid/non-JSON response. Both
+providers receive the exact same prompt, so results stay consistent regardless of which one
+actually answered.
 
+- **Region / data residency**: Qwen calls go to `dashscope-intl.aliyuncs.com`, Alibaba
+  Cloud's **Singapore/International** region — not the EU. An earlier version of this app
+  used a Frankfurt-specific endpoint (a workspace-scoped `eu-central-1.maas.aliyuncs.com`
+  URL, requiring a `DASHSCOPE_WORKSPACE_ID`), which is the correct setup if you need EU-only
+  processing — but that requires an API key issued specifically from a Frankfurt-region
+  Model Studio workspace (not a QwenCloud key, and not interchangeable with one — Alibaba
+  keys are region-locked). If that matters for your use case, get a Frankfurt key and revert
+  `QWEN_BASE_URL`/`_call_qwen()` in `app.py` to build the workspace-scoped URL instead (see
+  git history for the previous implementation).
 - **How to tell which provider handled a request**: nothing shows up when Qwen succeeds
   (the normal case). If Groq's fallback was used instead, you'll see a small
   "⚙️ Qwen was unavailable for this request — used Groq fallback" note under **Review & Edit**
   (Add Job tab) or **Review & Apply Update** (Update from Email tab).
 - **If both fail**: you'll get a clear error naming both providers and why each one failed
   (e.g. "not configured" vs. an actual API error) — never your API keys.
-- **If you only configure one provider**: that's fine. Configure just `DASHSCOPE_API_KEY` +
-  `DASHSCOPE_WORKSPACE_ID` to use Qwen only, or just `GROQ_API_KEY` to use Groq only (Qwen
-  will simply fail closed and fall through every time). Configuring neither means AI
-  features error out immediately with a setup message.
+- **If you only configure one provider**: that's fine. Configure just `DASHSCOPE_API_KEY` to
+  use Qwen only, or just `GROQ_API_KEY` to use Groq only (Qwen will simply fail closed and
+  fall through every time). Configuring neither means AI features error out immediately with
+  a setup message.
 
 ---
 
@@ -132,7 +138,6 @@ so results stay consistent regardless of which one actually answered.
 
 ```toml
 DASHSCOPE_API_KEY = "sk-..."
-DASHSCOPE_WORKSPACE_ID = "your-workspace-id"
 
 # Optional but recommended — automatic fallback if Qwen fails or isn't configured
 GROQ_API_KEY = "gsk_..."
