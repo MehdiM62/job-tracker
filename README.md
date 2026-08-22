@@ -3,7 +3,7 @@
 A Streamlit web app that extracts job details from any URL using AI and saves them to a Google Sheet.
 
 **Features**
-- Paste any job URL → AI (Qwen3.5-Flash via QwenCloud — with an automatic Groq fallback) extracts company, role, city, skills, contact, and more
+- Paste any job URL → AI (`openai/gpt-oss-120b` via OpenRouter — with an automatic direct-Groq fallback) extracts company, role, city, skills, contact, and more
 - Falls back to manual paste for sites that block scrapers (LinkedIn, etc.)
 - Optional job-fit matching against your career profile (Match Level + Missing Skills)
 - Source dropdown auto-detected from the URL, with an "Other" option for custom sources
@@ -26,16 +26,16 @@ A Streamlit web app that extracts job details from any URL using AI and saves th
 pip install -r requirements.txt
 ```
 
-### 2. Get a Qwen API key — primary provider
+### 2. Get an OpenRouter API key — primary provider
 
-1. Get an API key for `qwen3.5-flash` from [QwenCloud](https://www.qwencloud.com) (or the [Alibaba Cloud Model Studio console](https://www.alibabacloud.com/help/en/model-studio/first-api-call-to-qwen), which issues keys for the same backend) — it starts with `sk-...`
-2. Make sure the account has completed whatever eligibility/billing step Alibaba requires before API calls succeed — a key that authenticates but returns `403 AccessDenied.Unpurchased` on every model means this step isn't done yet (check the console for a "Some Features Restricted" banner or similar) — this is an account-level gate, not something this app's code can work around
-3. This app calls the **Singapore/International** endpoint (`dashscope-intl.aliyuncs.com`) — see the note in [AI provider & fallback](#ai-provider--fallback) below if you specifically need EU/Frankfurt data residency instead, which requires a different key and a small code change (a Frankfurt-region Model Studio workspace, not a QwenCloud key)
+1. Go to [openrouter.ai/keys](https://openrouter.ai/keys), sign in, and create a key — it starts with `sk-or-v1-...`
+2. Add pay-as-you-go credit (OpenRouter is prepaid, not billed after the fact)
+3. No model-specific activation needed — this app requests `openai/gpt-oss-120b` explicitly and OpenRouter routes it to whichever of its upstream providers is available for that model
 
 ### 2b. (Recommended) Get a Groq API key — automatic fallback
 
-Groq is not required for the app to work, but without it a Qwen outage or misconfiguration
-has nowhere to fall back to.
+Groq is not required for the app to work, but without it an OpenRouter outage or
+misconfiguration has nowhere to fall back to.
 
 1. Go to [console.groq.com/keys](https://console.groq.com/keys)
 2. Sign in and click **Create API Key**
@@ -56,18 +56,19 @@ has nowhere to fall back to.
 
 ```bash
 cp .env.example .env
-# Edit .env and add your DASHSCOPE_API_KEY and (recommended) GROQ_API_KEY
+# Edit .env and add your OPENROUTER_API_KEY and (recommended) GROQ_API_KEY
 ```
 
 Your `.env` should look like:
 ```
-DASHSCOPE_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-or-v1-...
 GROQ_API_KEY=gsk_...
 GOOGLE_CREDENTIALS_FILE=credentials.json
 ```
 
-`GROQ_API_KEY` is optional — the app only reaches for it if Qwen fails or isn't configured
-at all. Leaving both unset means AI features simply won't work until you add at least one.
+`GROQ_API_KEY` is optional — the app only reaches for it if OpenRouter fails or isn't
+configured at all. Leaving both unset means AI features simply won't work until you add at
+least one.
 
 ### 5. (Optional) Add a career profile for job matching
 
@@ -102,31 +103,39 @@ the `?pw=...` part) asks for the password again.
 ## AI provider & fallback
 
 All three AI operations (parsing a job posting, matching it against your career profile,
-and parsing an email) go through one shared function that always tries **Qwen3.5-Flash**
-first, and automatically falls back to **Groq (GPT-OSS-120B)** if Qwen fails for any reason
-— not configured, timeout, rate limit, API error, or an invalid/non-JSON response. Both
-providers receive the exact same prompt, so results stay consistent regardless of which one
-actually answered.
+and parsing an email) go through one shared function that always tries **OpenRouter**
+(`openai/gpt-oss-120b`) first, and automatically falls back to **direct Groq**
+(same model) if OpenRouter fails for any reason — not configured, timeout, rate limit, API
+error, or an invalid/non-JSON response. Both providers receive the exact same prompt, so
+results stay consistent regardless of which one actually answered. OpenRouter is requested
+to serve `openai/gpt-oss-120b` specifically (not OpenRouter's auto-router, and not a free
+variant) and routes that request among its own available upstream providers for that model.
 
-- **Region / data residency**: Qwen calls go to `dashscope-intl.aliyuncs.com`, Alibaba
-  Cloud's **Singapore/International** region — not the EU. An earlier version of this app
-  used a Frankfurt-specific endpoint (a workspace-scoped `eu-central-1.maas.aliyuncs.com`
-  URL, requiring a `DASHSCOPE_WORKSPACE_ID`), which is the correct setup if you need EU-only
-  processing — but that requires an API key issued specifically from a Frankfurt-region
-  Model Studio workspace (not a QwenCloud key, and not interchangeable with one — Alibaba
-  keys are region-locked). If that matters for your use case, get a Frankfurt key and revert
-  `QWEN_BASE_URL`/`_call_qwen()` in `app.py` to build the workspace-scoped URL instead (see
-  git history for the previous implementation).
-- **How to tell which provider handled a request**: nothing shows up when Qwen succeeds
+- **Reasoning output**: `gpt-oss-120b` is a reasoning model — without telling it otherwise,
+  it returns a large internal reasoning trace instead of the clean JSON object the prompts
+  ask for (confirmed live: a 130K+ character non-JSON response). The OpenRouter call sets
+  `extra_body={"reasoning": {"exclude": True}}`, OpenRouter's documented way to let the model
+  reason internally but exclude that trace from the returned content. Direct Groq isn't
+  affected by this — Groq's own hosting of the model apparently doesn't have the same
+  default behavior via its standard chat completions API.
+- **Privacy / provider routing**: OpenRouter documents a `provider.data_collection` field
+  (`"allow"` | `"deny"`) to restrict routing to only providers that don't store your data,
+  and a stricter `provider.zdr` (zero data retention) flag. Neither is applied by default in
+  this app — reliability was prioritized over restricting the provider pool, since it's
+  unclear how many of `gpt-oss-120b`'s upstream providers on OpenRouter would qualify. If you
+  want this, add `"provider": {"data_collection": "deny"}` (or `{"zdr": true}` for the
+  stricter option) to the `extra_body` in `_call_openrouter()` — test that OpenRouter still
+  finds a route for the model before relying on it.
+- **How to tell which provider handled a request**: nothing shows up when OpenRouter succeeds
   (the normal case). If Groq's fallback was used instead, you'll see a small
-  "⚙️ Qwen was unavailable for this request — used Groq fallback" note under **Review & Edit**
-  (Add Job tab) or **Review & Apply Update** (Update from Email tab).
+  "⚙️ OpenRouter was unavailable for this request — used Groq fallback" note under
+  **Review & Edit** (Add Job tab) or **Review & Apply Update** (Update from Email tab).
 - **If both fail**: you'll get a clear error naming both providers and why each one failed
   (e.g. "not configured" vs. an actual API error) — never your API keys.
-- **If you only configure one provider**: that's fine. Configure just `DASHSCOPE_API_KEY` to
-  use Qwen only, or just `GROQ_API_KEY` to use Groq only (Qwen will simply fail closed and
-  fall through every time). Configuring neither means AI features error out immediately with
-  a setup message.
+- **If you only configure one provider**: that's fine. Configure just `OPENROUTER_API_KEY` to
+  use OpenRouter only, or just `GROQ_API_KEY` to use Groq only (OpenRouter will simply fail
+  closed and fall through every time). Configuring neither means AI features error out
+  immediately with a setup message.
 
 ---
 
@@ -137,9 +146,9 @@ actually answered.
 3. In the app settings → **Secrets**, paste the contents of `.streamlit/secrets.toml.example` filled with your real values:
 
 ```toml
-DASHSCOPE_API_KEY = "sk-..."
+OPENROUTER_API_KEY = "sk-or-v1-..."
 
-# Optional but recommended — automatic fallback if Qwen fails or isn't configured
+# Optional but recommended — automatic fallback if OpenRouter fails or isn't configured
 GROQ_API_KEY = "gsk_..."
 
 # Optional — paste the full contents of your career profile .md file here to enable

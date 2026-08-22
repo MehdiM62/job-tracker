@@ -143,26 +143,21 @@ def _get_secret(name: str) -> str:
 
 
 # ── LLM provider abstraction ────────────────────────────────────────────────
-# Qwen3.5-Flash (via QwenCloud's OpenAI-compatible endpoint) is the primary provider
-# for all AI calls; Groq (GPT-OSS-120B) is an automatic fallback if Qwen fails for
-# any reason (not configured, timeout, rate limit, API error, or a malformed/
-# non-JSON response). Both providers get the exact same prompt — call_llm() is the
-# single place that knows about providers, so parse_job/parse_email/match_job stay
+# OpenRouter (routing to openai/gpt-oss-120b among its available upstream
+# providers) is the primary provider for all AI calls; direct Groq (same model)
+# is an automatic fallback if OpenRouter fails for any reason (not configured,
+# timeout, rate limit, API error, or a malformed/non-JSON response). Both
+# providers get the exact same prompt — call_llm() is the single place that
+# knows about providers, so parse_job/parse_email/match_job stay
 # provider-agnostic and their JSON schemas are untouched.
 #
-# NOTE on data residency: this endpoint (dashscope-intl.aliyuncs.com) is Alibaba
-# Cloud's Singapore/International region — NOT the EU/Frankfurt region. An earlier
-# attempt used the Frankfurt-specific workspace-scoped endpoint
-# (`{workspace_id}.eu-central-1.maas.aliyuncs.com`), which is the correct one for
-# EU data residency, but that Model Studio workspace hit an account-level
-# "AccessDenied.Unpurchased" restriction that didn't get resolved. This switch to
-# QwenCloud's direct dashscope-intl endpoint was a deliberate choice to get a
-# working setup — if EU-only processing becomes a hard requirement again, the fix
-# is a Frankfurt-region API key + workspace ID, not a code change (see git history
-# for the previous eu-central-1 implementation).
+# Previously used Qwen3.5-Flash (via Alibaba Cloud / QwenCloud) as primary, but
+# account-level access restrictions there ("AccessDenied.Unpurchased" on every
+# model, regardless of region or key) made it unworkable — see git history for
+# that implementation if revisiting Qwen later.
 
-QWEN_MODEL = "qwen3.5-flash"
-QWEN_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"  # Singapore/International
+OPENROUTER_MODEL = "openai/gpt-oss-120b"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GROQ_MODEL = "openai/gpt-oss-120b"
 
 
@@ -173,19 +168,29 @@ def _redact(text: str, *secrets: str) -> str:
     return text
 
 
-def _call_qwen(prompt: str) -> dict:
-    api_key = _get_secret("DASHSCOPE_API_KEY")
+def _call_openrouter(prompt: str) -> dict:
+    api_key = _get_secret("OPENROUTER_API_KEY")
     if not api_key:
-        raise RuntimeError("Qwen not configured (DASHSCOPE_API_KEY missing)")
+        raise RuntimeError("OpenRouter not configured (OPENROUTER_API_KEY missing)")
 
-    client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
+    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
     try:
         response = client.chat.completions.create(
-            model=QWEN_MODEL,
+            model=OPENROUTER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0,
-            extra_body={"enable_thinking": False},  # flash is extraction/matching, not reasoning
+            extra_headers={
+                # Optional site-attribution headers OpenRouter documents for rankings —
+                # non-sensitive, requests work fine without them if this ever changes.
+                "HTTP-Referer": "https://github.com/MehdiM62/job-tracker",
+                "X-Title": "Job Application Tracker",
+            },
+            # gpt-oss-120b is a reasoning model; without this it returns huge reasoning
+            # traces instead of the requested JSON object (confirmed via live testing —
+            # a 130K+ character non-JSON response). exclude=True keeps the model
+            # reasoning internally but strips that content from what's returned.
+            extra_body={"reasoning": {"exclude": True}},
         )
         content = response.choices[0].message.content
     except Exception as e:
@@ -193,7 +198,7 @@ def _call_qwen(prompt: str) -> dict:
 
     result = json.loads(content)  # JSONDecodeError also triggers call_llm()'s fallback
     if not isinstance(result, dict):
-        raise ValueError("Qwen response was not a JSON object")
+        raise ValueError("OpenRouter response was not a JSON object")
     return result
 
 
@@ -221,13 +226,13 @@ def _call_groq(prompt: str) -> dict:
 
 
 def call_llm(prompt: str) -> dict:
-    """Sends prompt to Qwen first, falling back to Groq if Qwen fails for any reason.
-    Records which provider actually handled the call in
+    """Sends prompt to OpenRouter first, falling back to direct Groq if OpenRouter
+    fails for any reason. Records which provider actually handled the call in
     st.session_state['llm_providers_used'] (a list the UI can inspect after a batch of
     calls to show a small "fallback used" note) — reset that list before starting a
     user-facing operation if you want an accurate per-operation view."""
     errors = []
-    for name, fn in (("qwen", _call_qwen), ("groq", _call_groq)):
+    for name, fn in (("openrouter", _call_openrouter), ("groq", _call_groq)):
         try:
             result = fn(prompt)
             try:
@@ -832,7 +837,7 @@ def main():
 
             st.subheader("Review & Edit")
             if st.session_state.get("parse_used_fallback"):
-                st.caption("⚙️ Qwen was unavailable for this request — used Groq fallback.")
+                st.caption("⚙️ OpenRouter was unavailable for this request — used Groq fallback.")
 
             # ── Match display ─────────────────────────────────────────────────
             match = st.session_state.get("match_result", {})
@@ -1022,7 +1027,7 @@ def main():
             st.divider()
             st.subheader("Review & Apply Update")
             if st.session_state.get("email_used_fallback"):
-                st.caption("⚙️ Qwen was unavailable for this request — used Groq fallback.")
+                st.caption("⚙️ OpenRouter was unavailable for this request — used Groq fallback.")
 
             matched_row = r.get("matched_row")
             ai_is_new_app = r.get("is_new_application_confirmation", False)
