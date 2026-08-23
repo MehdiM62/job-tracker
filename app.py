@@ -225,16 +225,24 @@ def _call_groq(prompt: str) -> dict:
     return result
 
 
-def call_llm(prompt: str) -> dict:
+def call_llm(prompt: str, fallback_prompt: str | None = None) -> dict:
     """Sends prompt to OpenRouter first, falling back to direct Groq if OpenRouter
     fails for any reason. Records which provider actually handled the call in
     st.session_state['llm_providers_used'] (a list the UI can inspect after a batch of
     calls to show a small "fallback used" note) — reset that list before starting a
-    user-facing operation if you want an accurate per-operation view."""
+    user-facing operation if you want an accurate per-operation view.
+
+    fallback_prompt lets a caller send Groq a smaller prompt than OpenRouter got (e.g.
+    a shorter candidate list) when the two providers have very different token-per-minute
+    budgets — see parse_email(). Defaults to the same prompt for both, which is the
+    right choice for callers whose prompt size doesn't vary by provider."""
     errors = []
-    for name, fn in (("openrouter", _call_openrouter), ("groq", _call_groq)):
+    for name, fn, p in (
+        ("openrouter", _call_openrouter, prompt),
+        ("groq", _call_groq, fallback_prompt if fallback_prompt is not None else prompt),
+    ):
         try:
-            result = fn(prompt)
+            result = fn(p)
             try:
                 st.session_state.setdefault("llm_providers_used", []).append(name)
             except Exception:
@@ -273,27 +281,40 @@ Job text:
     return result
 
 
-JOBS_LIST_CHAR_BUDGET = 12000  # keeps the prompt well under Groq's per-minute token limit
+# Candidate-list sizing for the "match this email to an applied job" prompt. Every
+# row costs real tokens, so the two providers get different budgets:
+#  - OpenRouter (primary) has a 131K-token context and no meaningfully tight per-minute
+#    limit for this key, so it gets (practically) the full job history — sending only
+#    the recent tail was silently making old applications unmatchable by the AI (it
+#    would still find them via fuzzy_find_job's exact company+role backstop, but only
+#    if the domain/company inference happened to be exact). The 100K-char ceiling is
+#    just a sanity cap against unbounded cost/latency if the sheet grows huge.
+#  - Groq (fallback) is capped at 8K tokens/minute on the free tier for this model
+#    (openai/gpt-oss-120b), so it keeps the old conservative budget. It's only used
+#    when OpenRouter fails, so trading candidate coverage for reliability there is fine.
+OPENROUTER_JOBS_CHAR_BUDGET = 100000
+GROQ_JOBS_CHAR_BUDGET = 12000
 
-def parse_email(email_text: str, jobs: list) -> dict:
-    # Sending every job can exceed the model's per-minute token budget once the sheet
-    # grows large (each row costs real tokens). Email updates are almost always about
-    # recent applications, so cap the candidate list to the most recent ones that fit
-    # a safe character budget — the UI's manual selector still covers full history.
+
+def _build_jobs_list(jobs: list, char_budget: int) -> tuple[str, bool]:
+    """Renders the most recent jobs (newest first in the source, oldest-first in the
+    output) that fit char_budget. Returns (rendered_list, was_truncated)."""
     lines, total_chars = [], 0
     for r in reversed(jobs):
         line = f"Row {r.get('No.', '')} | {r.get('Company', '')} | {r.get('Role', '')} | Status: {r.get('Status', '')}"
-        if total_chars + len(line) > JOBS_LIST_CHAR_BUDGET:
+        if total_chars + len(line) > char_budget:
             break
         lines.append(line)
         total_chars += len(line) + 1
-    jobs_list = "\n".join(reversed(lines))
+    return "\n".join(reversed(lines)), len(lines) < len(jobs)
+
+
+def _email_match_prompt(email_text: str, jobs_list: str, truncated: bool) -> str:
     truncated_note = (
         "\n(Only the most recent applications are listed above — if none match, set matched_row to null.)"
-        if len(lines) < len(jobs) else ""
+        if truncated else ""
     )
-
-    prompt = f"""You help track job applications. Analyze this email from a recruiter or company and match it to one of the applied jobs below.
+    return f"""You help track job applications. Analyze this email from a recruiter or company and match it to one of the applied jobs below.
 
 If the company name isn't spelled out in the email body, infer it from the sender's
 email domain (e.g. "haakon@bbraun.com" → "B. Braun") and match on that — recruiters
@@ -314,14 +335,33 @@ Return ONLY a JSON object with these fields:
   "email_date": "<date the email was sent/received, YYYY-MM-DD format — read it from the email's own date/header/signature, not today's date>",
   "email_datetime": "<the email's own date AND time, YYYY-MM-DD HH:MM format (24h) — used only if this becomes a brand-new sheet row>",
   "new_status": "<updated status — one of: Applied, Interview, Assessment, Offer, Rejected, Withdrawn>",
+  "status_confidence": "<high, medium, or low — confidence that new_status is the CORRECT reading of what this email says. High: explicit, unambiguous wording (e.g. \\"unfortunately we are unable to proceed with your application\\", \\"we would like to invite you to an interview\\"). Medium: status is strongly implied but not stated outright. Low: vague, templated, or boilerplate wording (e.g. \\"we will keep your profile on file\\", \\"your application is still being reviewed\\", auto-replies) where the real outcome is unclear — do not default to high just because a status must be picked>",
   "company_comments": "<concise summary of what THIS email says, one point per line starting with •\\n — do not include the email date, it is recorded separately, e.g.: • Interview invite: 2026-08-14 10:00 via Teams\\n• Next round: technical interview\\n• Rejection reason: overqualified>",
   "confidence": "<high, medium, or low — confidence that matched_row is the CORRECT row in the applied jobs list above. If matched_row is null, this must be low, even if you're sure about the company/role from the email itself>",
   "is_new_application_confirmation": <true/false — true only if this is an acknowledgment that a NEW application was just received (e.g. "Eingangsbestätigung", "we received your application", "thank you for applying"), not a status update on something already in progress>,
   "new_application_confidence": "<high, medium, or low — ONLY relevant when is_new_application_confirmation is true and matched_row is null: how confident are you this is a genuinely new, not-yet-tracked application, based on how clearly the company, role, and date are stated in the email>"
 }}"""
 
-    result = call_llm(prompt)
+
+def parse_email(email_text: str, jobs: list) -> dict:
+    primary_list, primary_truncated = _build_jobs_list(jobs, OPENROUTER_JOBS_CHAR_BUDGET)
+    primary_prompt = _email_match_prompt(email_text, primary_list, primary_truncated)
+
+    # Only bother building the smaller Groq-specific prompt when it would actually
+    # differ — small job histories fit the full budget either way.
+    if primary_truncated or len(primary_list) > GROQ_JOBS_CHAR_BUDGET:
+        fallback_list, fallback_truncated = _build_jobs_list(jobs, GROQ_JOBS_CHAR_BUDGET)
+        fallback_prompt = _email_match_prompt(email_text, fallback_list, fallback_truncated)
+    else:
+        fallback_prompt = None
+
+    result = call_llm(primary_prompt, fallback_prompt=fallback_prompt)
     result["company_comments"] = format_bullets(result.get("company_comments", ""))
+    # Models don't always match the prompt's lowercase "high/medium/low" casing exactly;
+    # normalize so the UI's dict lookups (keyed on lowercase) don't silently fall through.
+    for field in ("confidence", "status_confidence", "new_application_confidence"):
+        if isinstance(result.get(field), str):
+            result[field] = result[field].strip().lower()
     return result
 
 
@@ -1145,6 +1185,15 @@ def main():
                             STATUSES,
                             index=STATUSES.index(r.get("new_status", "Applied"))
                             if r.get("new_status") in STATUSES else 0,
+                        )
+                        status_conf = r.get("status_confidence", "low")
+                        status_conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(status_conf, "🔴")
+                        st.caption(f"Status confidence: {status_conf_color} **{status_conf.upper()}**")
+
+                    if status_conf == "low":
+                        st.warning(
+                            "⚠️ Low confidence that this status reading is correct — the email's "
+                            "wording is vague or templated. Double-check it before applying."
                         )
 
                     company_comments = st.text_area(
