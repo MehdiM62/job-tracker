@@ -1098,9 +1098,12 @@ def main():
 
             if fuzzy_matched:
                 st.info(
-                    f"🔎 AI wasn't sure, but found Row {matched_row} by matching the company name "
-                    f"**{r.get('matched_company', '')}** — please confirm it's correct below, or pick "
-                    f"\"{ADD_NEW_LABEL}\" if this is actually a different/new application."
+                    f"🔎 The AI couldn't cite an exact row number out of your full application "
+                    f"history, but a direct text match found Row {matched_row} — **both** company "
+                    f"(**{r.get('matched_company', '')}**) **and** role "
+                    f"(**{r.get('matched_role', '')}**) match this row exactly. Please confirm it's "
+                    f"correct below, or pick \"{ADD_NEW_LABEL}\" if this is actually a different/new "
+                    f"application."
                 )
             elif matched_row is not None:
                 confidence = r.get("confidence", "low")
