@@ -345,9 +345,17 @@ def normalize_company(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name)
 
 
+# Matches a German gender/diversity marker (m/w/d, w/m/d, m w d, ...) whether or not
+# it's wrapped in parens — an email's own wording (e.g. a subject line) sometimes drops
+# the parens/slashes the original job posting had, which would otherwise survive
+# normalize_role's non-alnum stripping as stray letters ("mwd") breaking a substring match.
+GENDER_MARKER_RE = re.compile(r"\b[mwdx](?:\s*/\s*|\s+)[mwdx](?:(?:\s*/\s*|\s+)[mwdx])?\b")
+
+
 def normalize_role(role: str) -> str:
     role = role.lower()
     role = re.sub(r"\([^)]*\)", "", role)  # strip gender/diversity tags like "(w/m/d)"
+    role = GENDER_MARKER_RE.sub("", role)  # ...and the same, unparenthesized, e.g. "m w d"
     return re.sub(r"[^a-z0-9]", "", role)
 
 
@@ -366,16 +374,27 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
     to the AI (a genuine duplicate of an old application). Checks the FULL job history,
     not just the truncated list — cheap and local, no extra API call.
 
-    Requires BOTH company and role to reasonably match, not company alone: a company can
-    have several separate tracked applications (a different role, an old rejected
-    attempt), and matching on company name only would silently point at the wrong one.
-    Also requires a minimum length and a single unambiguous candidate, since short names
-    (e.g. "SAP") risk false substring matches (e.g. "Sapient")."""
+    Requires a minimum company-name length, since short names (e.g. "SAP") risk false
+    substring matches (e.g. "Sapient"). If exactly one tracked application matches the
+    company, that's returned directly without also requiring the role to match: an
+    email's own wording of a role (e.g. from a subject line) can diverge a lot from the
+    abbreviated title stored when the job was first added — different length, extra
+    qualifiers, official vs. shortened title — and there's no ambiguity risk to guard
+    against when there's only one row for that company in the first place. Only when a
+    company has several separate tracked applications (a different role, an old
+    rejected attempt) does the role also need to match, so as not to silently point at
+    the wrong one."""
     target_co = normalize_company(matched_company or "")
-    target_role = normalize_role(matched_role or "")
-    if len(target_co) < 4 or len(target_role) < 4:
+    if len(target_co) < 4:
         return None
-    candidates = [j.get("No.") for j in jobs if _company_role_match(j, target_co, target_role)]
+    co_matches = [j for j in jobs if (co := normalize_company(str(j.get("Company", "")))) and (target_co in co or co in target_co)]
+    if len(co_matches) == 1:
+        return co_matches[0].get("No.")
+
+    target_role = normalize_role(matched_role or "")
+    if len(target_role) < 4:
+        return None
+    candidates = [j.get("No.") for j in co_matches if _company_role_match(j, target_co, target_role)]
     unique_rows = set(candidates)
     return candidates[0] if len(unique_rows) == 1 else None
 
