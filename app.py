@@ -225,24 +225,16 @@ def _call_groq(prompt: str) -> dict:
     return result
 
 
-def call_llm(prompt: str, fallback_prompt: str | None = None) -> dict:
+def call_llm(prompt: str) -> dict:
     """Sends prompt to OpenRouter first, falling back to direct Groq if OpenRouter
     fails for any reason. Records which provider actually handled the call in
     st.session_state['llm_providers_used'] (a list the UI can inspect after a batch of
     calls to show a small "fallback used" note) — reset that list before starting a
-    user-facing operation if you want an accurate per-operation view.
-
-    fallback_prompt lets a caller send Groq a smaller prompt than OpenRouter got (e.g.
-    a shorter candidate list) when the two providers have very different token-per-minute
-    budgets — see parse_email(). Defaults to the same prompt for both, which is the
-    right choice for callers whose prompt size doesn't vary by provider."""
+    user-facing operation if you want an accurate per-operation view."""
     errors = []
-    for name, fn, p in (
-        ("openrouter", _call_openrouter, prompt),
-        ("groq", _call_groq, fallback_prompt if fallback_prompt is not None else prompt),
-    ):
+    for name, fn in (("openrouter", _call_openrouter), ("groq", _call_groq)):
         try:
-            result = fn(p)
+            result = fn(prompt)
             try:
                 st.session_state.setdefault("llm_providers_used", []).append(name)
             except Exception:
@@ -281,54 +273,19 @@ Job text:
     return result
 
 
-# Candidate-list sizing for the "match this email to an applied job" prompt. Every
-# row costs real tokens, so the two providers get different budgets:
-#  - OpenRouter (primary) has a 131K-token context and no meaningfully tight per-minute
-#    limit for this key, so it gets (practically) the full job history — sending only
-#    the recent tail was silently making old applications unmatchable by the AI (it
-#    would still find them via fuzzy_find_job's exact company+role backstop, but only
-#    if the domain/company inference happened to be exact). The 100K-char ceiling is
-#    just a sanity cap against unbounded cost/latency if the sheet grows huge.
-#  - Groq (fallback) is capped at 8K tokens/minute on the free tier for this model
-#    (openai/gpt-oss-120b), so it keeps the old conservative budget. It's only used
-#    when OpenRouter fails, so trading candidate coverage for reliability there is fine.
-OPENROUTER_JOBS_CHAR_BUDGET = 100000
-GROQ_JOBS_CHAR_BUDGET = 12000
-
-
-def _build_jobs_list(jobs: list, char_budget: int) -> tuple[str, bool]:
-    """Renders the most recent jobs (newest first in the source, oldest-first in the
-    output) that fit char_budget. Returns (rendered_list, was_truncated)."""
-    lines, total_chars = [], 0
-    for r in reversed(jobs):
-        line = f"Row {r.get('No.', '')} | {r.get('Company', '')} | {r.get('Role', '')} | Status: {r.get('Status', '')}"
-        if total_chars + len(line) > char_budget:
-            break
-        lines.append(line)
-        total_chars += len(line) + 1
-    return "\n".join(reversed(lines)), len(lines) < len(jobs)
-
-
-def _email_match_prompt(email_text: str, jobs_list: str, truncated: bool) -> str:
-    truncated_note = (
-        "\n(Only the most recent applications are listed above — if none match, set matched_row to null.)"
-        if truncated else ""
-    )
-    return f"""You help track job applications. Analyze this email from a recruiter or company and match it to one of the applied jobs below.
+def _email_extract_prompt(email_text: str) -> str:
+    return f"""You help track job applications. Extract structured information from this email
+from a recruiter or company about a job application.
 
 If the company name isn't spelled out in the email body, infer it from the sender's
-email domain (e.g. "haakon@bbraun.com" → "B. Braun") and match on that — recruiters
+email domain (e.g. "haakon@bbraun.com" → "B. Braun") and use that — recruiters
 often only identify their company through the domain, not the visible text.
-
-Applied jobs:
-{jobs_list}{truncated_note}
 
 Email:
 {email_text}
 
 Return ONLY a JSON object with these fields:
 {{
-  "matched_row": <row number as integer, or null if unclear>,
   "matched_company": "<company name from the email>",
   "matched_role": "<role/position from the email>",
   "contact_person": "<recruiter/HR name, phone, email from the signature — otherwise 'Not specified'>",
@@ -337,32 +294,46 @@ Return ONLY a JSON object with these fields:
   "new_status": "<updated status — one of: Applied, Interview, Assessment, Offer, Rejected, Withdrawn>",
   "status_confidence": "<high, medium, or low — confidence that new_status is the CORRECT reading of what this email says. High: explicit, unambiguous wording (e.g. \\"unfortunately we are unable to proceed with your application\\", \\"we would like to invite you to an interview\\"). Medium: status is strongly implied but not stated outright. Low: vague, templated, or boilerplate wording (e.g. \\"we will keep your profile on file\\", \\"your application is still being reviewed\\", auto-replies) where the real outcome is unclear — do not default to high just because a status must be picked>",
   "company_comments": "<concise summary of what THIS email says, one point per line starting with •\\n — do not include the email date, it is recorded separately, e.g.: • Interview invite: 2026-08-14 10:00 via Teams\\n• Next round: technical interview\\n• Rejection reason: overqualified>",
-  "confidence": "<high, medium, or low — confidence that matched_row is the CORRECT row in the applied jobs list above. If matched_row is null, this must be low, even if you're sure about the company/role from the email itself>",
   "is_new_application_confirmation": <true/false — true only if this is an acknowledgment that a NEW application was just received (e.g. "Eingangsbestätigung", "we received your application", "thank you for applying"), not a status update on something already in progress>,
-  "new_application_confidence": "<high, medium, or low — ONLY relevant when is_new_application_confirmation is true and matched_row is null: how confident are you this is a genuinely new, not-yet-tracked application, based on how clearly the company, role, and date are stated in the email>"
+  "new_application_confidence": "<high, medium, or low — ONLY relevant when is_new_application_confirmation is true: how confident are you this is a genuinely new application, based on how clearly the company, role, and date are stated in the email>"
 }}"""
 
 
+def _looks_garbled(result: dict) -> bool:
+    """Cheap sanity check for a technically-valid-JSON but semantically broken response —
+    an occasional provider-level generation artifact observed in testing (e.g.
+    matched_company coming back as "Morgan ? " instead of the full name, new_status
+    missing entirely). Not exhaustive, just catches the obvious cases so one retry can
+    recover instead of silently feeding garbage into matching / the sheet."""
+    company = result.get("matched_company") or ""
+    role = result.get("matched_role") or ""
+    if "?" in company or "?" in role:
+        return True
+    return result.get("new_status") not in STATUSES
+
+
 def parse_email(email_text: str, jobs: list) -> dict:
-    primary_list, primary_truncated = _build_jobs_list(jobs, OPENROUTER_JOBS_CHAR_BUDGET)
-    primary_prompt = _email_match_prompt(email_text, primary_list, primary_truncated)
-
-    # Only bother building the smaller Groq-specific prompt when it would actually
-    # differ — small job histories fit the full budget either way.
-    if primary_truncated or len(primary_list) > GROQ_JOBS_CHAR_BUDGET:
-        fallback_list, fallback_truncated = _build_jobs_list(jobs, GROQ_JOBS_CHAR_BUDGET)
-        fallback_prompt = _email_match_prompt(email_text, fallback_list, fallback_truncated)
-    else:
-        fallback_prompt = None
-
-    result = call_llm(primary_prompt, fallback_prompt=fallback_prompt)
+    # The AI only extracts from the email text itself — no job list is sent. It's
+    # reliably accurate at that (company, role, status, dates, comments), which made
+    # the previous design's job list pointless for every field except matched_row: a
+    # row NUMBER cited out of a long (900+) candidate list, the one thing the model
+    # was NOT reliably accurate at — it could confidently cite the wrong row while
+    # still extracting the right company/role. So matched_row isn't asked of the AI at
+    # all; it's resolved deterministically below via fuzzy_find_job's company+role text
+    # match against the full job history, which is cheap, local, and doesn't share that
+    # failure mode. This also means the prompt no longer scales with sheet size — no
+    # per-provider budget juggling needed.
+    prompt = _email_extract_prompt(email_text)
+    result = call_llm(prompt)
+    if _looks_garbled(result):
+        result = call_llm(prompt)  # one retry — this failure mode has been observed to be transient
     result["company_comments"] = format_bullets(result.get("company_comments", ""))
     # Models don't always match the prompt's lowercase "high/medium/low" casing exactly;
     # normalize so the UI's dict lookups (keyed on lowercase) don't silently fall through.
-    for field in ("confidence", "status_confidence", "new_application_confidence"):
+    for field in ("status_confidence", "new_application_confidence"):
         if isinstance(result.get(field), str):
             result[field] = result[field].strip().lower()
-    _validate_matched_row(result, jobs)
+    result["matched_row"] = fuzzy_find_job(result.get("matched_company", ""), result.get("matched_role", ""), jobs)
     return result
 
 
@@ -407,29 +378,6 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
     candidates = [j.get("No.") for j in jobs if _company_role_match(j, target_co, target_role)]
     unique_rows = set(candidates)
     return candidates[0] if len(unique_rows) == 1 else None
-
-
-def _validate_matched_row(result: dict, jobs: list) -> None:
-    """Mutates result in place. The model reliably extracts matched_company/matched_role
-    from the email text itself, but reliably citing the correct ROW NUMBER out of a long
-    (900+) candidate list is a much harder, less reliable task for an LLM — it can name
-    the right company/role while confidently citing the wrong row, pointing at a totally
-    unrelated application. Since the extraction is trustworthy, use it to cross-check the
-    citation: if the cited row's actual company/role don't match what the model itself
-    extracted, discard the citation (matched_row -> None, confidence -> low) rather than
-    trust a self-contradictory result. The UI's fuzzy_find_job backstop then re-derives
-    the row deterministically from the (trustworthy) extraction."""
-    matched_row = result.get("matched_row")
-    if matched_row is None:
-        return
-    target_co = normalize_company(result.get("matched_company", "") or "")
-    target_role = normalize_role(result.get("matched_role", "") or "")
-    if len(target_co) < 4 or len(target_role) < 4:
-        return  # not enough signal in the extraction to safely contradict the citation
-    job = next((j for j in jobs if j.get("No.") == matched_row), None)
-    if job is None or not _company_role_match(job, target_co, target_role):
-        result["matched_row"] = None
-        result["confidence"] = "low"
 
 
 def match_job(parsed: dict, profile: str) -> dict:
@@ -1096,16 +1044,11 @@ def main():
             if st.session_state.get("email_used_fallback"):
                 st.caption("⚙️ OpenRouter was unavailable for this request — used Groq fallback.")
 
+            # matched_row was already resolved deterministically in parse_email() via
+            # fuzzy_find_job (company AND role text match against the full job history)
+            # — no AI row-number guessing involved.
             matched_row = r.get("matched_row")
             ai_is_new_app = r.get("is_new_application_confirmation", False)
-
-            # Always worth trying — it requires company AND role to match, so it safely
-            # catches a genuine duplicate the AI missed (e.g. a row outside the truncated
-            # candidate list) without misfiling a different role at the same company.
-            fuzzy_matched = False
-            if matched_row is None:
-                matched_row = fuzzy_find_job(r.get("matched_company", ""), r.get("matched_role", ""), jobs)
-                fuzzy_matched = matched_row is not None
 
             ADD_NEW_LABEL = "➕ Add as a new application (not in the sheet)"
             job_options = {
@@ -1123,19 +1066,13 @@ def main():
                         default_idx = i + 1  # +1 for the "Add as new" option at index 0
                         break
 
-            if fuzzy_matched:
+            if matched_row is not None:
                 st.info(
-                    f"🔎 The AI couldn't cite an exact row number out of your full application "
-                    f"history, but a direct text match found Row {matched_row} — **both** company "
-                    f"(**{r.get('matched_company', '')}**) **and** role "
-                    f"(**{r.get('matched_role', '')}**) match this row exactly. Please confirm it's "
-                    f"correct below, or pick \"{ADD_NEW_LABEL}\" if this is actually a different/new "
-                    f"application."
+                    f"🔎 Matched by company **and** role — Row {matched_row}: "
+                    f"**{r.get('matched_company', '')}** / **{r.get('matched_role', '')}**. Please "
+                    f"confirm it's correct below, or pick \"{ADD_NEW_LABEL}\" if this is actually a "
+                    f"different/new application."
                 )
-            elif matched_row is not None:
-                confidence = r.get("confidence", "low")
-                conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "🔴")
-                st.caption(f"Match confidence: {conf_color} **{confidence.upper()}**")
             elif ai_is_new_app:
                 conf = r.get("new_application_confidence", "low")
                 conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(conf, "🔴")
@@ -1146,8 +1083,8 @@ def main():
             else:
                 st.warning(
                     f"⚠️ No matching application found for **{r.get('matched_company', 'this company')} — "
-                    f"{r.get('matched_role', 'this role')}**. It may not be tracked yet, or falls outside "
-                    f"the recent-applications window sent to the AI — select the correct row below, or "
+                    f"{r.get('matched_role', 'this role')}**. It may not be tracked yet, or the company/role "
+                    f"wording doesn't closely match what's in your sheet — select the correct row below, or "
                     f"add it as a new application if it's missing entirely."
                 )
 
