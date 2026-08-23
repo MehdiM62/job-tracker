@@ -362,6 +362,7 @@ def parse_email(email_text: str, jobs: list) -> dict:
     for field in ("confidence", "status_confidence", "new_application_confidence"):
         if isinstance(result.get(field), str):
             result[field] = result[field].strip().lower()
+    _validate_matched_row(result, jobs)
     return result
 
 
@@ -377,6 +378,14 @@ def normalize_role(role: str) -> str:
     role = role.lower()
     role = re.sub(r"\([^)]*\)", "", role)  # strip gender/diversity tags like "(w/m/d)"
     return re.sub(r"[^a-z0-9]", "", role)
+
+
+def _company_role_match(job: dict, target_co: str, target_role: str) -> bool:
+    """target_co/target_role must already be normalize_company()/normalize_role()'d.
+    True if job's company AND role both loosely match (substring either direction)."""
+    co = normalize_company(str(job.get("Company", "")))
+    role = normalize_role(str(job.get("Role", "")))
+    return bool(co and role and (target_co in co or co in target_co) and (target_role in role or role in target_role))
 
 
 def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
@@ -395,14 +404,32 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
     target_role = normalize_role(matched_role or "")
     if len(target_co) < 4 or len(target_role) < 4:
         return None
-    candidates = []
-    for j in jobs:
-        co = normalize_company(str(j.get("Company", "")))
-        role = normalize_role(str(j.get("Role", "")))
-        if co and role and (target_co in co or co in target_co) and (target_role in role or role in target_role):
-            candidates.append(j.get("No."))
+    candidates = [j.get("No.") for j in jobs if _company_role_match(j, target_co, target_role)]
     unique_rows = set(candidates)
     return candidates[0] if len(unique_rows) == 1 else None
+
+
+def _validate_matched_row(result: dict, jobs: list) -> None:
+    """Mutates result in place. The model reliably extracts matched_company/matched_role
+    from the email text itself, but reliably citing the correct ROW NUMBER out of a long
+    (900+) candidate list is a much harder, less reliable task for an LLM — it can name
+    the right company/role while confidently citing the wrong row, pointing at a totally
+    unrelated application. Since the extraction is trustworthy, use it to cross-check the
+    citation: if the cited row's actual company/role don't match what the model itself
+    extracted, discard the citation (matched_row -> None, confidence -> low) rather than
+    trust a self-contradictory result. The UI's fuzzy_find_job backstop then re-derives
+    the row deterministically from the (trustworthy) extraction."""
+    matched_row = result.get("matched_row")
+    if matched_row is None:
+        return
+    target_co = normalize_company(result.get("matched_company", "") or "")
+    target_role = normalize_role(result.get("matched_role", "") or "")
+    if len(target_co) < 4 or len(target_role) < 4:
+        return  # not enough signal in the extraction to safely contradict the citation
+    job = next((j for j in jobs if j.get("No.") == matched_row), None)
+    if job is None or not _company_role_match(job, target_co, target_role):
+        result["matched_row"] = None
+        result["confidence"] = "low"
 
 
 def match_job(parsed: dict, profile: str) -> dict:
