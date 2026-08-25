@@ -935,6 +935,12 @@ def main():
             else:
                 source = source_choice
 
+            # Kept outside the form: a form's own widgets don't trigger a rerun until
+            # it's submitted, so a checkbox inside the form can't reactively re-enable
+            # the form's own submit button — checking it would never be "seen" before
+            # the (still-disabled) submit click that would normally deliver it.
+            proceed = st.checkbox("I know — add anyway") if dup else True
+
             with st.form("job_form"):
                 c1, c2 = st.columns(2)
                 with c1:
@@ -967,16 +973,10 @@ def main():
                 )
                 job_url    = st.text_input("Job URL", value=st.session_state.get("job_url", ""))
 
-                if dup:
-                    proceed = st.checkbox("I know — add anyway")
-                    submitted = st.form_submit_button(
-                        "✅ Add to Google Sheet", type="primary", use_container_width=True,
-                        disabled=not proceed,
-                    )
-                else:
-                    submitted = st.form_submit_button(
-                        "✅ Add to Google Sheet", type="primary", use_container_width=True,
-                    )
+                submitted = st.form_submit_button(
+                    "✅ Add to Google Sheet", type="primary", use_container_width=True,
+                    disabled=not proceed,
+                )
 
             if submitted:
                 try:
