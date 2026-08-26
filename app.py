@@ -597,6 +597,19 @@ def normalize_sheet_formatting(ws) -> dict:
     return {"rows_scanned": n_rows, "bullets_fixed": len(value_updates)}
 
 
+def _is_duplicate_submission(signature: tuple) -> bool:
+    """True if this exact submission was already accepted in this session. append_job()
+    has no dedup of its own — every call is a pure insert — so a double form submission
+    (a slow save plus an impatient second click, or a network hiccup replaying the
+    request before the UI had disabled the button) silently writes the same row twice.
+    Guards both append_job() call sites in main() against exactly that."""
+    return st.session_state.get("last_submission_sig") == signature
+
+
+def _mark_submitted(signature: tuple) -> None:
+    st.session_state["last_submission_sig"] = signature
+
+
 def append_job(data: dict) -> int:
     """Inserts the job at the sheet position that keeps Date Applied ascending —
     appends at the bottom if the date is newest (the common case), otherwise inserts
@@ -984,6 +997,15 @@ def main():
                 except ValueError:
                     st.error("Date Applied must be in YYYY-MM-DD HH:MM format.")
                     st.stop()
+
+                sig = ("add_job", company.strip().lower(), role.strip().lower(), job_url.strip(), date_applied.strip())
+                if _is_duplicate_submission(sig):
+                    st.session_state["success_msg"] = "Already added that one — skipped a duplicate submission."
+                    st.session_state["input_key"] += 1
+                    st.session_state.pop("parsed", None)
+                    st.session_state.pop("duplicate", None)
+                    st.rerun()
+
                 with st.spinner("Saving to Google Sheet..."):
                     try:
                         row_no = append_job({
@@ -996,6 +1018,7 @@ def main():
                             "missing_skills": missing_skills,
                             "date_applied": date_applied.strip(),
                         })
+                        _mark_submitted(sig)
                         st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
                         st.session_state["cv_lang"] = cv_edit
                         st.session_state["last_source"] = source
@@ -1140,6 +1163,15 @@ def main():
                     except ValueError:
                         st.error("Date Applied must be in YYYY-MM-DD HH:MM format.")
                         st.stop()
+
+                    sig = ("add_from_email", new_company.strip().lower(), new_role.strip().lower(), new_date.strip())
+                    if _is_duplicate_submission(sig):
+                        st.session_state["success_msg"] = "Already added that one — skipped a duplicate submission."
+                        st.session_state.pop("email_parsed", None)
+                        st.session_state.pop("email_jobs", None)
+                        st.session_state["email_key"] += 1
+                        st.rerun()
+
                     with st.spinner("Adding to Google Sheet..."):
                         try:
                             row_no = append_job({
@@ -1150,6 +1182,7 @@ def main():
                                 "match_level": "", "missing_skills": "",
                                 "date_applied": new_date.strip(),
                             })
+                            _mark_submitted(sig)
                             st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
                             st.session_state.pop("email_parsed", None)
                             st.session_state.pop("email_jobs", None)
