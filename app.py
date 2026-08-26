@@ -281,13 +281,17 @@ If the company name isn't spelled out in the email body, infer it from the sende
 email domain (e.g. "haakon@bbraun.com" → "B. Braun") and use that — recruiters
 often only identify their company through the domain, not the visible text.
 
+The email's own subject line is very often where the FULL, exact role title lives
+(the body frequently just says "your application" with no title at all) — read it
+from there whenever the body doesn't spell it out more completely.
+
 Email:
 {email_text}
 
 Return ONLY a JSON object with these fields:
 {{
   "matched_company": "<company name from the email>",
-  "matched_role": "<role/position from the email>",
+  "matched_role": "<the role/job title, copied in FULL exactly as written (subject line or body, whichever is more complete) — do not shorten it or drop a trailing qualifier (e.g. \\"- (Logistics - Customer, Time & Tracking)\\", \\"- AI & Service Strategy\\"). The same company can have several similar-sounding open roles that differ ONLY by that trailing detail, so dropping it makes the title match a different role than the one this email is actually about>",
   "contact_person": "<recruiter/HR name, phone, email from the signature — otherwise 'Not specified'>",
   "email_date": "<date the email was sent/received, YYYY-MM-DD format — read it from the email's own date/header/signature, not today's date>",
   "email_datetime": "<the email's own date AND time, YYYY-MM-DD HH:MM format (24h) — used only if this becomes a brand-new sheet row>",
@@ -345,16 +349,29 @@ def normalize_company(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name)
 
 
+# Matches ONLY a parenthesized German gender/diversity marker — "(m/w/d)", "(d / m / w)",
+# "(gn)", "(all genders)" — never a parenthetical with other content. Job titles routinely
+# use parens for a meaningful differentiator too (e.g. "(Logistics - Customer, Time &
+# Tracking)", "(Payments, Fintech)"), and blindly stripping every "(...)" collapsed
+# several genuinely different roles at the same company down to the same normalized
+# string, making fuzzy_find_job see false ambiguity where there wasn't any.
+GENDER_PAREN_RE = re.compile(
+    r"\(\s*[mwdxf](?:\s*[/|,]+\s*[mwdxf])+\s*\)"       # (m/w/d), (d / m / w), (m|w|d), (m,w,d)
+    r"|\(\s*gn\s*\)"                                     # (gn) — geschlechtsneutral
+    r"|\(\s*all\s+genders?(?:\s+welcome)?\s*\)",         # (all gender/genders[ welcome])
+    re.IGNORECASE,
+)
+
 # Matches a German gender/diversity marker (m/w/d, w/m/d, m w d, ...) whether or not
 # it's wrapped in parens — an email's own wording (e.g. a subject line) sometimes drops
 # the parens/slashes the original job posting had, which would otherwise survive
 # normalize_role's non-alnum stripping as stray letters ("mwd") breaking a substring match.
-GENDER_MARKER_RE = re.compile(r"\b[mwdx](?:\s*/\s*|\s+)[mwdx](?:(?:\s*/\s*|\s+)[mwdx])?\b")
+GENDER_MARKER_RE = re.compile(r"\b[mwdxf](?:\s*/\s*|\s+)[mwdxf](?:(?:\s*/\s*|\s+)[mwdxf])?\b")
 
 
 def normalize_role(role: str) -> str:
     role = role.lower()
-    role = re.sub(r"\([^)]*\)", "", role)  # strip gender/diversity tags like "(w/m/d)"
+    role = GENDER_PAREN_RE.sub("", role)   # strip a parenthesized gender/diversity marker only
     role = GENDER_MARKER_RE.sub("", role)  # ...and the same, unparenthesized, e.g. "m w d"
     return re.sub(r"[^a-z0-9]", "", role)
 
@@ -394,9 +411,20 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
     target_role = normalize_role(matched_role or "")
     if len(target_role) < 4:
         return None
-    candidates = [j.get("No.") for j in co_matches if _company_role_match(j, target_co, target_role)]
-    unique_rows = set(candidates)
-    return candidates[0] if len(unique_rows) == 1 else None
+    candidates = [j for j in co_matches if _company_role_match(j, target_co, target_role)]
+
+    # A company with several tracked applications often has more than one substring-
+    # matching candidate when one role's title is a plain prefix of another's more
+    # specific one (e.g. "Senior Technical Product Manager" vs. "...Product Manager -
+    # (Logistics - Customer, Time & Tracking)") — both legitimately contain the
+    # shorter title as a substring, but only one is an exact match. Prefer that one
+    # over guessing; only fall back to "ambiguous" when there's no unique exact match.
+    exact = [j for j in candidates if normalize_role(str(j.get("Role", ""))) == target_role]
+    if len(exact) == 1:
+        return exact[0].get("No.")
+
+    unique_rows = {j.get("No.") for j in candidates}
+    return candidates[0].get("No.") if len(unique_rows) == 1 else None
 
 
 def match_job(parsed: dict, profile: str) -> dict:
