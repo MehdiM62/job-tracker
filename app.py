@@ -338,7 +338,9 @@ def parse_email(email_text: str, jobs: list) -> dict:
     for field in ("status_confidence", "new_application_confidence"):
         if isinstance(result.get(field), str):
             result[field] = result[field].strip().lower()
-    result["matched_row"] = fuzzy_find_job(result.get("matched_company", ""), result.get("matched_role", ""), jobs)
+    result["matched_row"], result["matched_row_candidates"] = fuzzy_find_job(
+        result.get("matched_company", ""), result.get("matched_role", ""), jobs
+    )
     return result
 
 
@@ -385,7 +387,7 @@ def _company_role_match(job: dict, target_co: str, target_role: str) -> bool:
     return bool(co and role and (target_co in co or co in target_co) and (target_role in role or role in target_role))
 
 
-def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
+def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list) -> tuple:
     """Deterministic backstop for when the AI can't confidently match a row — e.g. the
     company is only identifiable via the sender's email domain (which this model doesn't
     infer reliably every time), or the row is outside the truncated candidate list sent
@@ -401,17 +403,27 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
     against when there's only one row for that company in the first place. Only when a
     company has several separate tracked applications (a different role, an old
     rejected attempt) does the role also need to match, so as not to silently point at
-    the wrong one."""
+    the wrong one.
+
+    Returns (row_no, ambiguous_row_nos): row_no is the resolved match, or None if no
+    single row could be picked. ambiguous_row_nos is non-empty only when two or more
+    genuinely different tracked rows are indistinguishable after normalization — e.g. the
+    same company+role tracked twice, one posting's title carrying a gender marker like
+    "(m/w/d)" and the other not (normalize_role() strips that marker on purpose so both
+    count as the same role for matching, but that means it can't tell such rows apart
+    either). Callers should surface those candidates to the user instead of reporting a
+    plain "no match found", which would be misleading — there WAS a match, just not a
+    unique one."""
     target_co = normalize_company(matched_company or "")
     if len(target_co) < 4:
-        return None
+        return None, []
     co_matches = [j for j in jobs if (co := normalize_company(str(j.get("Company", "")))) and (target_co in co or co in target_co)]
     if len(co_matches) == 1:
-        return co_matches[0].get("No.")
+        return co_matches[0].get("No."), []
 
     target_role = normalize_role(matched_role or "")
     if len(target_role) < 4:
-        return None
+        return None, []
     candidates = [j for j in co_matches if _company_role_match(j, target_co, target_role)]
 
     # A company with several tracked applications often has more than one substring-
@@ -422,10 +434,12 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list):
     # over guessing; only fall back to "ambiguous" when there's no unique exact match.
     exact = [j for j in candidates if normalize_role(str(j.get("Role", ""))) == target_role]
     if len(exact) == 1:
-        return exact[0].get("No.")
+        return exact[0].get("No."), []
 
-    unique_rows = {j.get("No.") for j in candidates}
-    return candidates[0].get("No.") if len(unique_rows) == 1 else None
+    unique_rows = sorted({j.get("No.") for j in candidates})
+    if len(unique_rows) == 1:
+        return candidates[0].get("No."), []
+    return None, unique_rows
 
 
 def match_job(parsed: dict, profile: str) -> dict:
@@ -1259,6 +1273,7 @@ def main():
             # fuzzy_find_job (company AND role text match against the full job history)
             # — no AI row-number guessing involved.
             matched_row = r.get("matched_row")
+            ambiguous_rows = r.get("matched_row_candidates") or []
             ai_is_new_app = r.get("is_new_application_confirmation", False)
 
             ADD_NEW_LABEL = "➕ Add as a new application (not in the sheet)"
@@ -1269,7 +1284,16 @@ def main():
             options_list = [ADD_NEW_LABEL] + list(job_options.keys())
 
             if matched_row is None:
-                default_idx = 0 if ai_is_new_app else 1
+                if ambiguous_rows:
+                    # Point at the first tied candidate rather than an unrelated row —
+                    # the user just needs to pick between these, not hunt the whole list.
+                    default_idx = 1
+                    for i, no in enumerate(job_options.values()):
+                        if no == ambiguous_rows[0]:
+                            default_idx = i + 1
+                            break
+                else:
+                    default_idx = 0 if ai_is_new_app else 1
             else:
                 default_idx = 1
                 for i, no in enumerate(job_options.values()):
@@ -1283,6 +1307,14 @@ def main():
                     f"**{r.get('matched_company', '')}** / **{r.get('matched_role', '')}**. Please "
                     f"confirm it's correct below, or pick \"{ADD_NEW_LABEL}\" if this is actually a "
                     f"different/new application."
+                )
+            elif ambiguous_rows:
+                rows_str = ", ".join(f"#{n}" for n in ambiguous_rows)
+                st.warning(
+                    f"🤔 Found **{len(ambiguous_rows)} tracked applications** for "
+                    f"**{r.get('matched_company', 'this company')} — {r.get('matched_role', 'this role')}** "
+                    f"that look identical once formatting differences (like a trailing \"(m/w/d)\") are "
+                    f"ignored — rows {rows_str}. Pick the correct one below."
                 )
             elif ai_is_new_app:
                 conf = r.get("new_application_confidence", "low")
