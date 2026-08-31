@@ -10,6 +10,7 @@ import pytz
 import json
 import os
 import re
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -731,6 +732,56 @@ def update_job_from_email(row_no: int, new_status: str, company_comments: str, e
     return False
 
 
+# ── Cross-session recovery ───────────────────────────────────────────────────
+# Streamlit Cloud can silently drop a mobile browser's session while its tab is
+# backgrounded (switching apps, screen lock) — a Fetch & Parse already in flight keeps
+# running and finishes server-side regardless (plain Python calls aren't tied to the
+# websocket), but if the session that started it gets evicted before the user comes
+# back, st.session_state is gone and the finished result looks like it vanished. This
+# cache is a process-wide dict shared by every session in the running app (unlike
+# st.session_state, which is per-session) — stashing a snapshot here lets a fresh
+# session recover the most recent result instead of losing it outright.
+
+FETCH_RESULT_TTL_SECONDS = 30 * 60
+
+
+@st.cache_resource
+def _fetch_result_store() -> dict:
+    return {}
+
+
+def _save_fetch_snapshot() -> None:
+    store = _fetch_result_store()
+    store.clear()
+    for key in ("parsed", "job_url", "cv_lang", "match_result", "match_error",
+                "profile_loaded", "parse_used_fallback", "duplicate"):
+        if key in st.session_state:
+            store[key] = st.session_state[key]
+    store["saved_at"] = time.time()
+
+
+def _clear_fetch_store() -> None:
+    _fetch_result_store().clear()
+
+
+def _restore_fetch_snapshot_if_needed() -> None:
+    """Called on every render of the Add Job tab. If this session has no in-progress or
+    finished parse of its own but the process-wide store has a recent one, adopts it —
+    recovering a result that was computed under a session which no longer exists."""
+    if "parsed" in st.session_state:
+        return
+    store = _fetch_result_store()
+    if not store.get("parsed"):
+        return
+    if time.time() - store.get("saved_at", 0) > FETCH_RESULT_TTL_SECONDS:
+        store.clear()
+        return
+    for key, value in store.items():
+        if key != "saved_at":
+            st.session_state[key] = value
+    st.session_state["restored_from_recovery"] = True
+
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 # Hardcoded password gate — stops a stumbled-upon URL from touching real data.
 # Not real security (the password travels in the URL), just a low-effort filter.
@@ -794,7 +845,11 @@ def main():
                 "Q&A export into Comments) — converts pipe-delimited text to bullets and "
                 "reapplies consistent row formatting. Safe to run repeatedly."
             )
-            if st.button("Normalize formatting"):
+            normalizing = st.session_state.get("normalizing", False)
+            if st.button("Normalize formatting", disabled=normalizing):
+                st.session_state["normalizing"] = True
+                st.rerun()
+            if st.session_state.get("normalizing"):
                 with st.spinner("Scanning and reformatting..."):
                     try:
                         ws = get_worksheet()
@@ -805,6 +860,10 @@ def main():
                         )
                     except Exception as e:
                         st.error(f"Normalization failed: {e}")
+                    finally:
+                        st.session_state["normalizing"] = False
+
+        _restore_fetch_snapshot_if_needed()
 
         k = st.session_state["input_key"]
 
@@ -830,70 +889,115 @@ def main():
                 key=f"manual_{k}",
             )
 
-        fetch = st.button("🔍 Fetch & Parse", type="primary")
+        # Fetch & Parse runs as a small state machine (fetch_stage) rather than one big
+        # block: each stage does one unit of work, saves its result to session_state
+        # (and to the cross-session recovery store above) and immediately reruns to the
+        # next stage. This both lets the button disable itself while busy (its disabled=
+        # reflects fetch_stage, checked at the top of every run) and shrinks the amount
+        # of work that could be lost if this specific session's connection drops mid-way
+        # — Python keeps executing server-side either way, so each stage's progress is
+        # captured as it happens rather than only once the whole pipeline finishes.
+        fetch = st.button(
+            "🔍 Fetch & Parse", type="primary",
+            disabled=st.session_state.get("fetch_stage") is not None,
+        )
 
         if fetch:
-            text = manual_text.strip()
-            if url.strip() and not text:
-                with st.spinner("Fetching job page..."):
-                    try:
-                        html = fetch_url(url.strip())
-                        text = html_to_text(html)
-                        if len(text) < 100:
-                            st.warning("Page content looks too short — try pasting manually.")
+            st.session_state["fetch_stage"] = "fetch_text"
+            st.session_state["fetch_job_url"] = url.strip()
+            st.session_state["fetch_cv_lang"] = cv_lang
+            st.session_state["fetch_manual_text"] = manual_text.strip()
+            st.rerun()
+
+        stage = st.session_state.get("fetch_stage")
+        if stage:
+            _url = st.session_state.get("fetch_job_url", "")
+            _cv_lang = st.session_state.get("fetch_cv_lang", "EN")
+
+            if stage == "fetch_text":
+                text = st.session_state.get("fetch_manual_text", "")
+                if _url and not text:
+                    with st.spinner("Fetching job page..."):
+                        try:
+                            html = fetch_url(_url)
+                            text = html_to_text(html)
+                            if len(text) < 100:
+                                st.warning("Page content looks too short — try pasting manually.")
+                                st.session_state["fetch_stage"] = None
+                                st.stop()
+                        except RuntimeError as e:
+                            st.error(f"Could not fetch the page: {e}")
+                            st.info("Use the **paste manually** option above instead.")
+                            st.session_state["fetch_stage"] = None
                             st.stop()
-                    except RuntimeError as e:
-                        st.error(f"Could not fetch the page: {e}")
-                        st.info("Use the **paste manually** option above instead.")
-                        st.stop()
 
-            if not text:
-                st.warning("Enter a URL or paste the job description.")
-                st.stop()
-
-            st.session_state["llm_providers_used"] = []  # reset before this batch of AI calls
-
-            with st.spinner("Parsing with AI..."):
-                try:
-                    parsed = parse_job(text, url.strip() or "")
-                    st.session_state["parsed"] = parsed
-                    st.session_state["job_url"] = url.strip()
-                    st.session_state["cv_lang"] = cv_lang
-                    st.session_state.pop("duplicate", None)
-                    st.session_state.pop("match_result", None)
-                except json.JSONDecodeError:
-                    st.error("AI returned unexpected output. Try again.")
-                    st.stop()
-                except Exception as e:
-                    st.error(f"Parsing failed: {e}")
+                if not text:
+                    st.warning("Enter a URL or paste the job description.")
+                    st.session_state["fetch_stage"] = None
                     st.stop()
 
-            profile = load_career_profile()
-            st.session_state["profile_loaded"] = bool(profile)
-            if profile:
-                with st.spinner("Matching against your profile..."):
+                st.session_state["fetch_text_content"] = text
+                st.session_state["llm_providers_used"] = []  # reset before this batch of AI calls
+                st.session_state["fetch_stage"] = "parse"
+                st.rerun()
+
+            elif stage == "parse":
+                text = st.session_state.get("fetch_text_content", "")
+                with st.spinner("Parsing with AI..."):
                     try:
-                        match = match_job(parsed, profile)
-                        st.session_state["match_result"] = match
+                        parsed = parse_job(text, _url)
+                        st.session_state["parsed"] = parsed
+                        st.session_state["job_url"] = _url
+                        st.session_state["cv_lang"] = _cv_lang
+                        st.session_state.pop("duplicate", None)
+                        st.session_state.pop("match_result", None)
+                        st.session_state.pop("match_error", None)
+                    except json.JSONDecodeError:
+                        st.error("AI returned unexpected output. Try again.")
+                        st.session_state["fetch_stage"] = None
+                        st.stop()
                     except Exception as e:
-                        st.session_state["match_error"] = str(e)
+                        st.error(f"Parsing failed: {e}")
+                        st.session_state["fetch_stage"] = None
+                        st.stop()
+                _save_fetch_snapshot()
+                st.session_state["fetch_stage"] = "match"
+                st.rerun()
 
-            st.session_state["parse_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
+            elif stage == "match":
+                parsed = st.session_state.get("parsed", {})
+                profile = load_career_profile()
+                st.session_state["profile_loaded"] = bool(profile)
+                if profile:
+                    with st.spinner("Matching against your profile..."):
+                        try:
+                            match = match_job(parsed, profile)
+                            st.session_state["match_result"] = match
+                        except Exception as e:
+                            st.session_state["match_error"] = str(e)
+                st.session_state["parse_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
+                _save_fetch_snapshot()
+                st.session_state["fetch_stage"] = "dupcheck"
+                st.rerun()
 
-            # Duplicate check
-            with st.spinner("Checking for duplicates..."):
-                try:
-                    ws = get_worksheet()
-                    dup = find_duplicate(
-                        ws,
-                        url.strip(),
-                        parsed.get("company", ""),
-                        parsed.get("role", ""),
-                    )
-                    if dup:
-                        st.session_state["duplicate"] = dup
-                except Exception:
-                    pass  # Don't block on duplicate check failure
+            elif stage == "dupcheck":
+                parsed = st.session_state.get("parsed", {})
+                with st.spinner("Checking for duplicates..."):
+                    try:
+                        ws = get_worksheet()
+                        dup = find_duplicate(
+                            ws,
+                            st.session_state.get("job_url", ""),
+                            parsed.get("company", ""),
+                            parsed.get("role", ""),
+                        )
+                        if dup:
+                            st.session_state["duplicate"] = dup
+                    except Exception:
+                        pass  # Don't block on duplicate check failure
+                _save_fetch_snapshot()
+                st.session_state["fetch_stage"] = None
+                st.rerun()
 
         # ── Review form ───────────────────────────────────────────────────────
         if "parsed" in st.session_state:
@@ -901,6 +1005,12 @@ def main():
             dup = st.session_state.get("duplicate")
 
             st.divider()
+
+            if st.session_state.pop("restored_from_recovery", False):
+                st.info(
+                    "↩️ Restored your last **Fetch & Parse** result — the page must have "
+                    "reloaded (e.g. the browser tab was backgrounded) before you could see it."
+                )
 
             if dup:
                 st.warning(
@@ -910,7 +1020,17 @@ def main():
                     f"status: {dup.get('Status')})."
                 )
 
-            st.subheader("Review & Edit")
+            col_review, col_discard = st.columns([5, 1])
+            with col_review:
+                st.subheader("Review & Edit")
+            with col_discard:
+                if st.button("✖️ Discard", help="Clear this result without saving"):
+                    st.session_state.pop("parsed", None)
+                    st.session_state.pop("duplicate", None)
+                    st.session_state.pop("match_result", None)
+                    st.session_state.pop("match_error", None)
+                    _clear_fetch_store()
+                    st.rerun()
             if st.session_state.get("parse_used_fallback"):
                 st.caption("⚙️ OpenRouter was unavailable for this request — used Groq fallback.")
 
@@ -1016,14 +1136,19 @@ def main():
 
                 submitted = st.form_submit_button(
                     "✅ Add to Google Sheet", type="primary", use_container_width=True,
-                    disabled=not proceed,
+                    disabled=not proceed or st.session_state.get("adding_job", False),
                 )
 
             if submitted:
+                st.session_state["adding_job"] = True
+                st.rerun()
+
+            if st.session_state.get("adding_job"):
                 try:
                     datetime.strptime(date_applied.strip(), "%Y-%m-%d %H:%M")
                 except ValueError:
                     st.error("Date Applied must be in YYYY-MM-DD HH:MM format.")
+                    st.session_state["adding_job"] = False
                     st.stop()
 
                 sig = ("add_job", company.strip().lower(), role.strip().lower(), job_url.strip(), date_applied.strip())
@@ -1032,6 +1157,7 @@ def main():
                     st.session_state["input_key"] += 1
                     st.session_state.pop("parsed", None)
                     st.session_state.pop("duplicate", None)
+                    st.session_state["adding_job"] = False
                     st.rerun()
 
                 with st.spinner("Saving to Google Sheet..."):
@@ -1053,11 +1179,15 @@ def main():
                         st.session_state["input_key"] += 1
                         st.session_state.pop("parsed", None)
                         st.session_state.pop("duplicate", None)
+                        _clear_fetch_store()
+                        st.session_state["adding_job"] = False
                         st.rerun()
                     except FileNotFoundError as e:
                         st.error(str(e))
+                        st.session_state["adding_job"] = False
                     except Exception as e:
                         st.error(f"Failed to write to sheet: {e}")
+                        st.session_state["adding_job"] = False
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 2 — Update from Email
@@ -1075,35 +1205,46 @@ def main():
             key=f"email_{ek}",
         )
 
-        parse_email_btn = st.button("🔍 Parse Email", type="primary", key="parse_email_btn")
+        parse_email_btn = st.button(
+            "🔍 Parse Email", type="primary", key="parse_email_btn",
+            disabled=st.session_state.get("parsing_email", False),
+        )
 
         if parse_email_btn:
             if not email_text.strip():
                 st.warning("Paste an email first.")
                 st.stop()
+            st.session_state["parsing_email"] = True
+            st.session_state["pending_email_text"] = email_text.strip()
+            st.rerun()
 
-            with st.spinner("Loading your applications..."):
-                try:
-                    ws = get_worksheet()
-                    jobs = get_all_jobs(ws)
-                    if not jobs:
-                        st.error("No job applications found in the sheet yet.")
+        if st.session_state.get("parsing_email"):
+            try:
+                email_body = st.session_state.get("pending_email_text", "")
+                with st.spinner("Loading your applications..."):
+                    try:
+                        ws = get_worksheet()
+                        jobs = get_all_jobs(ws)
+                        if not jobs:
+                            st.error("No job applications found in the sheet yet.")
+                            st.stop()
+                    except Exception as e:
+                        st.error(f"Could not load sheet: {e}")
                         st.stop()
-                except Exception as e:
-                    st.error(f"Could not load sheet: {e}")
-                    st.stop()
 
-            st.session_state["llm_providers_used"] = []  # reset before this AI call
+                st.session_state["llm_providers_used"] = []  # reset before this AI call
 
-            with st.spinner("Parsing email with AI..."):
-                try:
-                    result = parse_email(email_text.strip(), jobs)
-                    st.session_state["email_parsed"] = result
-                    st.session_state["email_jobs"] = jobs
-                    st.session_state["email_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
-                except Exception as e:
-                    st.error(f"Parsing failed: {e}")
-                    st.stop()
+                with st.spinner("Parsing email with AI..."):
+                    try:
+                        result = parse_email(email_body, jobs)
+                        st.session_state["email_parsed"] = result
+                        st.session_state["email_jobs"] = jobs
+                        st.session_state["email_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
+                    except Exception as e:
+                        st.error(f"Parsing failed: {e}")
+                        st.stop()
+            finally:
+                st.session_state["parsing_email"] = False
 
         if "email_parsed" in st.session_state:
             r = st.session_state["email_parsed"]
@@ -1183,13 +1324,19 @@ def main():
 
                     add_btn = st.form_submit_button(
                         "➕ Add to Google Sheet", type="primary", use_container_width=True,
+                        disabled=st.session_state.get("adding_from_email", False),
                     )
 
                 if add_btn:
+                    st.session_state["adding_from_email"] = True
+                    st.rerun()
+
+                if st.session_state.get("adding_from_email"):
                     try:
                         datetime.strptime(new_date.strip(), "%Y-%m-%d %H:%M")
                     except ValueError:
                         st.error("Date Applied must be in YYYY-MM-DD HH:MM format.")
+                        st.session_state["adding_from_email"] = False
                         st.stop()
 
                     sig = ("add_from_email", new_company.strip().lower(), new_role.strip().lower(), new_date.strip())
@@ -1198,6 +1345,7 @@ def main():
                         st.session_state.pop("email_parsed", None)
                         st.session_state.pop("email_jobs", None)
                         st.session_state["email_key"] += 1
+                        st.session_state["adding_from_email"] = False
                         st.rerun()
 
                     with st.spinner("Adding to Google Sheet..."):
@@ -1215,9 +1363,11 @@ def main():
                             st.session_state.pop("email_parsed", None)
                             st.session_state.pop("email_jobs", None)
                             st.session_state["email_key"] += 1
+                            st.session_state["adding_from_email"] = False
                             st.rerun()
                         except Exception as e:
                             st.error(f"Failed to add: {e}")
+                            st.session_state["adding_from_email"] = False
 
             else:
                 selected_row_no = job_options[selected_label]
@@ -1249,9 +1399,16 @@ def main():
                         height=200,
                     )
 
-                    apply_btn = st.form_submit_button("✅ Update Sheet", type="primary", use_container_width=True)
+                    apply_btn = st.form_submit_button(
+                        "✅ Update Sheet", type="primary", use_container_width=True,
+                        disabled=st.session_state.get("updating_sheet", False),
+                    )
 
                 if apply_btn:
+                    st.session_state["updating_sheet"] = True
+                    st.rerun()
+
+                if st.session_state.get("updating_sheet"):
                     with st.spinner("Updating sheet..."):
                         try:
                             ok = update_job_from_email(selected_row_no, new_status, company_comments, email_date)
@@ -1262,11 +1419,14 @@ def main():
                                 st.session_state.pop("email_parsed", None)
                                 st.session_state.pop("email_jobs", None)
                                 st.session_state["email_key"] += 1  # clears email text area
+                                st.session_state["updating_sheet"] = False
                                 st.rerun()
                             else:
                                 st.error(f"Row #{selected_row_no} not found in the sheet.")
+                                st.session_state["updating_sheet"] = False
                         except Exception as e:
                             st.error(f"Failed to update sheet: {e}")
+                            st.session_state["updating_sheet"] = False
 
 
 if __name__ == "__main__":
