@@ -15,6 +15,10 @@ A Streamlit web app that extracts job details from any URL using AI and saves th
   existing application, then appends a dated history entry (status change + details) to
   that row's Company Comments — nothing gets overwritten, so interview steps, follow-ups,
   and the eventual accept/reject all stay visible in one place
+- **📦 Bulk Email Update** tab (optional, needs Gmail OAuth setup — see below): scans
+  Gmail read-only for historical job-search emails, groups them per application, and
+  proposes sheet updates for you to review and approve — nothing is written until you
+  explicitly apply it
 
 ---
 
@@ -172,6 +176,118 @@ client_x509_cert_url = "..."
 ```
 
 > Tip: copy the values directly from your `credentials.json` file into the `[gcp_service_account]` block.
+
+---
+
+## 📦 Bulk Email Update (Gmail)
+
+Optional. A separate tab that scans your Gmail (read-only) for historical job-search
+emails and proposes sheet updates for you to review — for backfilling months of
+applications without pasting them one at a time into **Update from Email**. It's
+purely additive: everything else in the app works exactly the same whether or not you
+set this up, and until you do, the tab just shows a short "not configured" message.
+
+**How it works, in one paragraph:** you connect your Gmail account once (OAuth,
+read-only), pick a date range and a Gmail label, and click **Scan Gmail**. Scanning
+only *reads* — it never touches your Google Sheet. Each matching email is run through
+the same AI extraction and deterministic row-matching the single-email flow already
+uses, then emails that resolve to the same tracked row are grouped into one proposal
+(current vs. proposed Status/Contact/Comments) for you to approve, edit, or skip.
+Nothing is written to the sheet until you click **Apply Approved Updates**, and only
+for the items you approved. Ambiguous matches are never guessed — you're always shown
+the candidate rows and asked to pick.
+
+### 1. Enable the Gmail API
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) and open the
+   **same project** your `credentials.json` service account belongs to (or a new one —
+   either works, Gmail OAuth is independent of the Sheets service account).
+2. **APIs & Services → Library** → search **Gmail API** → **Enable**.
+
+### 2. Configure the OAuth consent screen
+
+1. **APIs & Services → OAuth consent screen**.
+2. User type: **External** is fine — keep publishing status as **Testing** (this is a
+   personal single-user tool; Testing mode skips Google's app-verification process,
+   which is only required for public-facing apps, and supports up to 100 test users).
+3. Under **Test users**, add your own Gmail address.
+4. Scopes: you don't need to add `gmail.readonly` here — the app requests it directly
+   at login time (see below). Leave scopes as-is.
+
+### 3. Create an OAuth Client ID
+
+1. **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
+2. Application type: **Web application**.
+3. Under **Authorized redirect URIs**, add *both* (you can use the app locally and on
+   Streamlit Cloud with the same client):
+   - `http://localhost:8501`
+   - `https://your-app-name.streamlit.app` (your actual deployed Streamlit Cloud URL)
+4. Save. Copy the **Client ID** and **Client secret**.
+
+### 4. Add the secrets
+
+Locally, in `.env`:
+
+```
+GOOGLE_GMAIL_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_GMAIL_CLIENT_SECRET=your-client-secret
+GOOGLE_GMAIL_REDIRECT_URI=http://localhost:8501
+```
+
+On Streamlit Cloud, in the same **Secrets** box as step 3 of the deploy section above,
+add the same three keys but with `GOOGLE_GMAIL_REDIRECT_URI` set to your deployed app's
+own URL (must exactly match one of the redirect URIs you registered above).
+
+### 5. First login
+
+Open the **📦 Bulk Email Update** tab and click **Connect Gmail**. You'll see Google's
+consent screen naming exactly one permission — *"Read your email messages and
+settings"* (the `gmail.readonly` scope) — nothing about sending, deleting, or managing
+labels is ever requested. Since the app is in Testing mode, Google will show an
+"unverified app" warning; that's expected for a personal tool only you use — click
+**Advanced → Go to (app name) (unsafe)** to proceed. After granting access you're
+redirected back to the app already connected.
+
+### Where the Gmail token is stored (and why)
+
+The refresh token is stored in a **hidden worksheet tab** (`_gmail_oauth_token`) in the
+same spreadsheet, not in a local file. Streamlit Cloud's local disk is wiped on every
+redeploy (which happens on every git push to this repo), so a local token file would
+force you to reconnect Gmail almost every time you pushed a change. The service account
+that already reads/writes this entire spreadsheet is the same one that can read this
+hidden tab, so this doesn't expand what's already trusted with your data — it's just
+one more (hidden, out of your normal tabs' way) worksheet. The token is never logged or
+shown in the UI. Click **Disconnect** in the tab to clear it at any time.
+
+### Testing safely — how to scan without changing anything
+
+Scanning is always read-only by construction — `scan_period()` (in `gmail_bulk.py`)
+never calls the functions that write to Sheets; only the **Apply Approved Updates**
+button does, and only for rows you've explicitly marked **Approve**. To try a 2025 scan
+without risk:
+
+1. Connect Gmail, select **Period: 2025**, leave the label as `Jobsearch` (or your own
+   label), click **Scan Gmail**.
+2. Review the summary and the grouped proposals — expand a few, check the
+   current-vs-proposed fields.
+3. Stop there. As long as you don't click **Apply Approved Updates**, your Google Sheet
+   is untouched — you can verify this yourself by checking the sheet's revision history
+   in Google Sheets (File → Version history) before and after scanning.
+4. Re-running the same scan is safe too — a lightweight **Email Import Log** worksheet
+   (auto-created, visible in your sheet tabs) tracks which Gmail messages were already
+   *applied* (not merely scanned), so a repeat scan skips them and won't duplicate
+   comments or re-bill the AI for emails you've already processed.
+
+### Known limitations
+
+- The OAuth `state` parameter isn't cross-validated on the callback — acceptable for a
+  single-user personal tool behind its own password gate, but worth knowing if you ever
+  expose this app more broadly.
+- Large scans page through Gmail's API sequentially (list + fetch per message, no batch
+  requests yet) — hundreds of messages will take a while but will complete.
+- The Gmail label filter matches Gmail's own `label:"..."` search syntax; if your label
+  name has changed, update the label field in the Bulk Email Update tab (it doesn't have
+  to be `Jobsearch`, that's just the default).
 
 ---
 

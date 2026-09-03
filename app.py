@@ -10,10 +10,19 @@ import pytz
 import json
 import os
 import re
+import sys
 import time
 from dotenv import load_dotenv
 
+import gmail_bulk
+
 load_dotenv()
+
+# gmail_bulk.py needs to call back into this module (extract_email_info,
+# fuzzy_find_job, update_job_from_email, append_job, etc.) without a real circular
+# `import app` — see gmail_bulk.py's module docstring for why. sys.modules[__name__]
+# is this module however it's actually running (as "__main__" under `streamlit run`).
+gmail_bulk.app = sys.modules[__name__]
 
 APP_PASSWORD = "abc123"
 
@@ -959,6 +968,11 @@ def main():
         login_gate()
         st.stop()
 
+    # Processes Google's OAuth redirect (?code=...) if present — no-ops instantly on
+    # every normal page load. Runs before any tab renders so it fires regardless of
+    # which tab was active when the browser was sent to Google and back.
+    gmail_bulk.handle_oauth_callback()
+
     st.title("💼 Job Application Tracker")
 
     if "input_key" not in st.session_state:
@@ -978,7 +992,9 @@ def main():
     # one, Streamlit relies on fragile client-side-only memory to keep the same tab
     # selected across reruns, which intermittently resets to the first tab (e.g. right
     # after the "Parse Email" button triggers a rerun mid-spinner).
-    tab_add, tab_email = st.tabs(["➕ Add Job", "📧 Update from Email"], key="active_tab")
+    tab_add, tab_email, tab_bulk = st.tabs(
+        ["➕ Add Job", "📧 Update from Email", "📦 Bulk Email Update"], key="active_tab"
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 1 — Add Job
@@ -1631,6 +1647,12 @@ def main():
                             _flash("error", f"Failed to update sheet: {e}")
                             st.session_state["updating_sheet"] = False
                             st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — Bulk Email Update (Gmail)
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_bulk:
+        gmail_bulk.render_bulk_email_tab()
 
 
 if __name__ == "__main__":
