@@ -345,6 +345,13 @@ environment — never into a file that gets committed to GitHub.
 account and by when you're reading this — if you see one, it's expected for a personal
 Testing-mode app only you use; there isn't one exact screen to guarantee here.)
 
+**If step 6 lands you back on the Job Tracker login screen instead of Connected:**
+that's Streamlit Cloud's own session occasionally not surviving the trip out to
+Google's consent screen and back — not a broken OAuth flow. Just log in again with
+your application password; the app still has the OAuth code from the URL and finishes
+connecting Gmail as soon as you're back in, no need to click Connect Gmail a second
+time.
+
 ### H. Safe first test
 
 Before trusting it with your full history, run a small, conservative test:

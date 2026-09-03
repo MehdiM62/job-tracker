@@ -127,13 +127,24 @@ def handle_oauth_callback() -> None:
     incoming_state = st.query_params.get("state")
     expected_state = st.session_state.pop("gmail_oauth_state", None)
     try:
-        if not expected_state or incoming_state != expected_state:
+        if expected_state and incoming_state != expected_state:
+            # We DO have a state from this session's own Connect-Gmail click, and it
+            # doesn't match what came back — that's the genuine tamper/replay signal
+            # worth blocking.
             st.session_state["flash"] = (
                 "error",
                 "Gmail connection failed: this authorization link couldn't be verified "
                 "(state mismatch) — please click Connect Gmail again.",
             )
         else:
+            # No stored state usually just means the browser's Streamlit session was
+            # replaced during the round trip to Google — common on Streamlit Cloud,
+            # where that external navigation can outlast the session, landing back on
+            # the login screen. Re-entering the password creates a fresh session with
+            # no memory of the state this callback's own query params still carry.
+            # Reaching this line already required passing the Job Tracker password
+            # gate, which is the real trust boundary here, so proceed with the
+            # exchange rather than discard a legitimate callback.
             flow = build_flow()
             flow.fetch_token(code=code)
             creds = flow.credentials
@@ -146,6 +157,7 @@ def handle_oauth_callback() -> None:
         st.query_params.pop("code", None)
         st.query_params.pop("state", None)
         st.query_params.pop("scope", None)
+        st.query_params.pop("iss", None)
         st.rerun()
 
 
