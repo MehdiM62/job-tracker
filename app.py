@@ -339,7 +339,8 @@ def parse_email(email_text: str, jobs: list) -> dict:
         if isinstance(result.get(field), str):
             result[field] = result[field].strip().lower()
     result["matched_row"], result["matched_row_candidates"] = fuzzy_find_job(
-        result.get("matched_company", ""), result.get("matched_role", ""), jobs
+        result.get("matched_company", ""), result.get("matched_role", ""), jobs,
+        email_date=result.get("email_date", ""),
     )
     return result
 
@@ -387,12 +388,46 @@ def _company_role_match(job: dict, target_co: str, target_role: str) -> bool:
     return bool(co and role and (target_co in co or co in target_co) and (target_role in role or role in target_role))
 
 
-def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list) -> tuple:
+def _jobs_eligible_by_date(jobs: list, email_date: str) -> list:
+    """Keeps only rows that could plausibly be what the email is about — i.e. were
+    already applied to on or before the email's own date. A status update/rejection/
+    interview invite necessarily comes AFTER the application it refers to, so a row
+    added later can't be the one being referenced; excluding it lets a genuine tie (e.g.
+    two rows tracked for the same company+role, one from months ago and a fresh
+    duplicate) resolve to the older one instead of staying ambiguous.
+
+    Keeps rows whose own Date Applied can't be parsed (safer to include than silently
+    drop one that might be the right match), and applies no filtering at all when
+    email_date itself is missing or unparseable — better to fall back to the old
+    company/role-only behavior than wrongly exclude everything."""
+    try:
+        email_dt = datetime.strptime((email_date or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return jobs
+
+    eligible = []
+    for j in jobs:
+        raw = str(j.get("Date Applied", "")).strip()
+        try:
+            row_dt = datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        except ValueError:
+            eligible.append(j)
+            continue
+        if row_dt <= email_dt:
+            eligible.append(j)
+    return eligible
+
+
+def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list, email_date: str = "") -> tuple:
     """Deterministic backstop for when the AI can't confidently match a row — e.g. the
     company is only identifiable via the sender's email domain (which this model doesn't
     infer reliably every time), or the row is outside the truncated candidate list sent
     to the AI (a genuine duplicate of an old application). Checks the FULL job history,
     not just the truncated list — cheap and local, no extra API call.
+
+    email_date (the email's own date, "YYYY-MM-DD") first narrows the candidate pool to
+    rows applied on or before it — see _jobs_eligible_by_date. Everything below operates
+    on that narrowed pool.
 
     Requires a minimum company-name length, since short names (e.g. "SAP") risk false
     substring matches (e.g. "Sapient"). If exactly one tracked application matches the
@@ -405,6 +440,13 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list) -> tuple
     rejected attempt) does the role also need to match, so as not to silently point at
     the wrong one.
 
+    If the company text doesn't even partially match any row (e.g. the email spells out
+    a full legal name, abbreviation, or translation the sheet's normalized Company string
+    doesn't overlap with as a substring), falls back to matching on an exact role title
+    alone across every date-eligible row regardless of company — but only trusts that
+    when it's the ONE row with that exact title, so a generic title reused across several
+    different tracked companies stays ambiguous rather than being guessed.
+
     Returns (row_no, ambiguous_row_nos): row_no is the resolved match, or None if no
     single row could be picked. ambiguous_row_nos is non-empty only when two or more
     genuinely different tracked rows are indistinguishable after normalization — e.g. the
@@ -414,14 +456,32 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list) -> tuple
     either). Callers should surface those candidates to the user instead of reporting a
     plain "no match found", which would be misleading — there WAS a match, just not a
     unique one."""
-    target_co = normalize_company(matched_company or "")
-    if len(target_co) < 4:
-        return None, []
-    co_matches = [j for j in jobs if (co := normalize_company(str(j.get("Company", "")))) and (target_co in co or co in target_co)]
-    if len(co_matches) == 1:
-        return co_matches[0].get("No."), []
+    jobs = _jobs_eligible_by_date(jobs, email_date)
 
+    target_co = normalize_company(matched_company or "")
     target_role = normalize_role(matched_role or "")
+
+    co_matches = []
+    if len(target_co) >= 4:
+        co_matches = [j for j in jobs if (co := normalize_company(str(j.get("Company", "")))) and (target_co in co or co in target_co)]
+        if len(co_matches) == 1:
+            return co_matches[0].get("No."), []
+
+    if not co_matches:
+        # Company text gave no substring signal at all — fall back to role-only, but
+        # only act on it when the exact title is unique across the whole eligible pool.
+        # A generic title ("Product Owner") can legitimately be tied across a dozen+
+        # different companies once company isn't narrowing anything down — past a small
+        # handful of ties that's noise, not a useful set of candidates to show, so treat
+        # it the same as no match rather than dumping a huge row list on the user.
+        if len(target_role) >= 4:
+            role_exact = [j for j in jobs if normalize_role(str(j.get("Role", ""))) == target_role]
+            if len(role_exact) == 1:
+                return role_exact[0].get("No."), []
+            if 1 < len(role_exact) <= 8:
+                return None, sorted({j.get("No.") for j in role_exact})
+        return None, []
+
     if len(target_role) < 4:
         return None, []
     candidates = [j for j in co_matches if _company_role_match(j, target_co, target_role)]
@@ -1333,7 +1393,10 @@ def main():
                     f"different/new application."
                 )
             elif ambiguous_rows:
-                rows_str = ", ".join(f"#{n}" for n in ambiguous_rows)
+                shown = ambiguous_rows[:8]
+                rows_str = ", ".join(f"#{n}" for n in shown)
+                if len(ambiguous_rows) > len(shown):
+                    rows_str += f", and {len(ambiguous_rows) - len(shown)} more"
                 st.warning(
                     f"🤔 Found **{len(ambiguous_rows)} tracked applications** for "
                     f"**{r.get('matched_company', 'this company')} — {r.get('matched_role', 'this role')}** "
