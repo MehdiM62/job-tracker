@@ -798,11 +798,42 @@ def append_job(data: dict, sheet_name: str | None = None) -> int:
     return new_no
 
 
-def update_job_from_email(row_no: int, new_status: str, company_comments: str, email_date: str, sheet_name: str | None = None) -> bool:
+def _is_blank_field(value) -> bool:
+    """True for an empty cell or the literal placeholder "Not specified" (case-
+    insensitive) — the two ways a field can be "missing" in this sheet. Used to decide
+    what update_job_from_email() is allowed to backfill: never a cell that already holds
+    real content, no matter how short."""
+    v = str(value or "").strip()
+    return v == "" or v.lower() == "not specified"
+
+
+# Columns update_job_from_email() may backfill on the matched row — but ONLY when the
+# row's own cell is currently blank/"Not specified"; a populated cell is never touched.
+# (sheet column name, email-extraction dict key)
+BACKFILL_FIELDS = [
+    ("Company", "matched_company"),
+    ("Role", "matched_role"),
+    ("Contact Person", "contact_person"),
+]
+
+
+def update_job_from_email(
+    row_no: int, new_status: str, company_comments: str, email_date: str,
+    sheet_name: str | None = None, email_info: dict | None = None,
+) -> tuple[bool, list[str]]:
     """Applies an email-derived update as a new dated history entry appended to
     Company Comments — prior entries (status changes, interview steps, etc.)
     are preserved rather than overwritten. sheet_name targets a specific tab (e.g. the
-    "2025" archive); omitted keeps the existing default of the current-year sheet1."""
+    "2025" archive); omitted keeps the existing default of the current-year sheet1.
+
+    email_info (the dict extract_email_info() returned) is also used to backfill
+    Company/Role/Contact Person on the matched row wherever that field is currently
+    blank or "Not specified" — e.g. a row added with Contact Person left unspecified
+    gets filled in once an email actually names a recruiter. A cell that already holds
+    real content is never overwritten, even if the email's value differs.
+
+    Returns (success, backfilled_field_names) — the latter empty when nothing needed
+    filling, so the caller can mention what else got updated."""
     ws = get_worksheet(sheet_name)
     col_map = ensure_extra_cols(ws)
     all_values = ws.get_all_values()
@@ -811,6 +842,7 @@ def update_job_from_email(row_no: int, new_status: str, company_comments: str, e
     skills_col = header.index("Key Skills Required") + 1
     missing_col = header.index("Missing Skills") + 1
     cc_col = col_map["Company Comments"]
+    email_info = email_info or {}
 
     for i, row in enumerate(all_values[1:], start=2):
         if row and str(row[0]).strip() == str(row_no):
@@ -829,11 +861,20 @@ def update_job_from_email(row_no: int, new_status: str, company_comments: str, e
             combined = (existing.strip() + "\n\n---\n\n" + entry).strip() if existing.strip() else entry
             ws.update_cell(i, cc_col, combined)
 
+            filled = []
+            for col_name, info_key in BACKFILL_FIELDS:
+                col_idx = header.index(col_name) + 1
+                current = row[col_idx - 1] if len(row) >= col_idx else ""
+                new_value = str(email_info.get(info_key) or "").strip()
+                if _is_blank_field(current) and new_value and not _is_blank_field(new_value):
+                    ws.update_cell(i, col_idx, new_value)
+                    filled.append(col_name)
+
             skills = row[skills_col - 1] if len(row) >= skills_col else ""
             missing = row[missing_col - 1] if len(row) >= missing_col else ""
             format_row(ws, i, [skills, combined, missing])
-            return True
-    return False
+            return True, filled
+    return False, []
 
 
 # ── Cross-session recovery ───────────────────────────────────────────────────
@@ -1570,14 +1611,15 @@ def main():
                 if st.session_state.get("updating_sheet"):
                     with st.spinner("Updating sheet..."):
                         try:
-                            ok = update_job_from_email(
+                            ok, filled_fields = update_job_from_email(
                                 selected_row_no, new_status, company_comments, email_date,
-                                sheet_name=target_sheet,
+                                sheet_name=target_sheet, email_info=r,
                             )
                             if ok:
                                 sheet_note = f" ({target_sheet} sheet)" if target_sheet else ""
+                                fill_note = f" — also filled in {', '.join(filled_fields)}" if filled_fields else ""
                                 st.session_state["success_msg"] = (
-                                    f"✅ Row #{selected_row_no} updated{sheet_note} — Status: {new_status}"
+                                    f"✅ Row #{selected_row_no} updated{sheet_note} — Status: {new_status}{fill_note}"
                                 )
                                 st.session_state.pop("email_parsed", None)
                                 st.session_state.pop("email_jobs", None)
