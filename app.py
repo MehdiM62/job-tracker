@@ -7,6 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 import pytz
+import hmac
 import json
 import os
 import re
@@ -23,8 +24,6 @@ load_dotenv()
 # `import app` — see gmail_bulk.py's module docstring for why. sys.modules[__name__]
 # is this module however it's actually running (as "__main__" under `streamlit run`).
 gmail_bulk.app = sys.modules[__name__]
-
-APP_PASSWORD = "abc123"
 
 SHEET_ID = "1-9pSqdaqp8Sx_jhq1dq-KE0ExN4BdkHmpSXg-tzeEms"
 CET = pytz.timezone("Europe/Berlin")
@@ -933,30 +932,44 @@ def _restore_fetch_snapshot_if_needed() -> None:
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-# Hardcoded password gate — stops a stumbled-upon URL from touching real data.
-# Not real security (the password travels in the URL), just a low-effort filter.
+# Single-user password gate. Authentication lives only in st.session_state for the
+# current Streamlit session — never in the URL, a cookie, or localStorage — so it's
+# gone on a fresh browser session, page reload after the server restarts, or a new
+# deploy. That's intentional: this app now holds Sheets + a persisted Gmail OAuth
+# refresh token, so a password that leaks by simply being visible in a shared/bookmarked
+# URL is no longer an acceptable tradeoff for the convenience of staying "logged in".
 
 def is_authenticated() -> bool:
-    if st.session_state.get("authenticated"):
-        return True
-    if st.query_params.get("pw") == APP_PASSWORD:
-        st.session_state["authenticated"] = True
-        return True
-    return False
+    return bool(st.session_state.get("authenticated"))
 
 
 def login_gate() -> None:
     st.title("🔒 Job Tracker")
+
+    app_password = _get_secret("APP_PASSWORD")
+    if not app_password:
+        st.error(
+            "⚠️ APP_PASSWORD is not configured. Add it to Streamlit secrets (or your "
+            "local .env) before this app can be used — see the README's setup section. "
+            "Failing closed on purpose: no default password, no access without one."
+        )
+        return
+
     with st.form("login_form"):
         pw = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Log in", type="primary")
     if submitted:
-        if pw == APP_PASSWORD:
+        if hmac.compare_digest(pw, app_password):
             st.session_state["authenticated"] = True
-            st.query_params["pw"] = APP_PASSWORD
             st.rerun()
         else:
             st.error("Incorrect password.")
+
+
+def logout_button() -> None:
+    if st.session_state.get("authenticated") and st.sidebar.button("🚪 Logout"):
+        st.session_state["authenticated"] = False
+        st.rerun()
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -968,9 +981,15 @@ def main():
         login_gate()
         st.stop()
 
+    logout_button()
+
     # Processes Google's OAuth redirect (?code=...) if present — no-ops instantly on
     # every normal page load. Runs before any tab renders so it fires regardless of
-    # which tab was active when the browser was sent to Google and back.
+    # which tab was active when the browser was sent to Google and back. Deliberately
+    # placed AFTER the auth check above: Gmail OAuth and Job Tracker login are separate
+    # concerns, and a URL carrying a stray ?code=&state= (e.g. a stale/replayed link)
+    # must not by itself grant access to the tracker — it's only ever processed once
+    # this session already passed the password gate on its own.
     gmail_bulk.handle_oauth_callback()
 
     st.title("💼 Job Application Tracker")

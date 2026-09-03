@@ -60,19 +60,21 @@ misconfiguration has nowhere to fall back to.
 
 ```bash
 cp .env.example .env
-# Edit .env and add your OPENROUTER_API_KEY and (recommended) GROQ_API_KEY
+# Edit .env and add APP_PASSWORD, your OPENROUTER_API_KEY, and (recommended) GROQ_API_KEY
 ```
 
 Your `.env` should look like:
 ```
+APP_PASSWORD=a-strong-password-only-you-know
 OPENROUTER_API_KEY=sk-or-v1-...
 GROQ_API_KEY=gsk_...
 GOOGLE_CREDENTIALS_FILE=credentials.json
 ```
 
-`GROQ_API_KEY` is optional — the app only reaches for it if OpenRouter fails or isn't
-configured at all. Leaving both unset means AI features simply won't work until you add at
-least one.
+`APP_PASSWORD` is required — see [Password gate](#password-gate) below; the app refuses
+to run without it, on purpose. `GROQ_API_KEY` is optional — the app only reaches for it
+if OpenRouter fails or isn't configured at all. Leaving both AI keys unset means AI
+features simply won't work until you add at least one.
 
 ### 5. (Optional) Add a career profile for job matching
 
@@ -93,14 +95,25 @@ Opens at `http://localhost:8501` — you'll hit a password prompt first, see [Pa
 
 ## Password gate
 
-The app is gated by a single hardcoded password (`APP_PASSWORD` in `app.py`, default
-`abc123`) — just enough to stop someone who stumbles on the URL from touching your data.
-It's not real security: change `APP_PASSWORD` before deploying anywhere semi-public.
+The app is gated by a single application password, stored as the `APP_PASSWORD`
+secret/environment variable — never hardcoded, never a fallback. This matters more than
+it used to: the app now also holds a Google Sheets service account and a persisted
+Gmail OAuth refresh token, so the gate needed to stop being "just enough to deter a
+stumbled-upon URL."
 
-After logging in, the password is appended to the URL as `?pw=...` — reloading or
-revisiting that exact URL skips the login prompt again, so bookmark it once and that
-browser/tab stays "logged in" indefinitely. Visiting the bare URL (or sharing it without
-the `?pw=...` part) asks for the password again.
+- **Set your own password.** Pick a strong, unique value and put it in `.env` locally
+  or Streamlit Secrets when deployed (see below). There is no default — if
+  `APP_PASSWORD` isn't set, the app shows a configuration error and refuses to run
+  rather than falling back to anything.
+- **The password is never in the URL, a cookie, or localStorage.** It's compared with
+  `hmac.compare_digest()` and, once correct, kept only in
+  `st.session_state["authenticated"]` for the current Streamlit session. There's
+  nothing to bookmark or share by URL.
+- **You'll be asked again** after the browser/tab's session ends, after the Streamlit
+  process restarts, or after a redeploy. That's the intended tradeoff for a
+  single-user personal tool — simple and safe rather than persistent and clever.
+- **Logout**: a small **🚪 Logout** button in the sidebar clears the session and
+  returns you to the login screen.
 
 ---
 
@@ -150,6 +163,10 @@ variant) and routes that request among its own available upstream providers for 
 3. In the app settings → **Secrets**, paste the contents of `.streamlit/secrets.toml.example` filled with your real values:
 
 ```toml
+# Required — the app fails closed without this. Pick a strong, unique password; it
+# never appears in the URL, a cookie, or localStorage.
+APP_PASSWORD = "replace-with-a-strong-random-password"
+
 OPENROUTER_API_KEY = "sk-or-v1-..."
 
 # Optional but recommended — automatic fallback if OpenRouter fails or isn't configured
@@ -189,42 +206,99 @@ set this up, and until you do, the tab just shows a short "not configured" messa
 
 **How it works, in one paragraph:** you connect your Gmail account once (OAuth,
 read-only), pick a date range and a Gmail label, and click **Scan Gmail**. Scanning
-only *reads* — it never touches your Google Sheet. Each matching email is run through
-the same AI extraction and deterministic row-matching the single-email flow already
-uses, then emails that resolve to the same tracked row are grouped into one proposal
-(current vs. proposed Status/Contact/Comments) for you to approve, edit, or skip.
-Nothing is written to the sheet until you click **Apply Approved Updates**, and only
-for the items you approved. Ambiguous matches are never guessed — you're always shown
-the candidate rows and asked to pick.
+only *reads* — it never touches your Google Sheet, and any email sent *from* your own
+address (e.g. a reply inside a labeled recruiter thread) is filtered out deterministically
+before it ever reaches the AI, at no LLM cost. Each remaining email is run through the
+same AI extraction and deterministic row-matching the single-email flow already uses,
+routed to the **2025** archive tab or your current-year sheet based on the email's own
+date — same logic as **Update from Email**, just applied at scan time. Emails that
+resolve to the same tracked row are grouped into one proposal (current vs. proposed
+Status/Contact/Comments, each proposed comment editable before you approve it) for you
+to approve, edit, or skip. Ambiguous matches are never guessed — you're shown enough
+detail on each candidate row (company, role, status, date applied) to pick the right
+one yourself. Nothing is written to the sheet until you click **Apply Approved
+Updates**, and only for the items you approved.
 
-### 1. Enable the Gmail API
+The setup below matches the current Google Auth Platform UI (Google has redesigned
+this a few times — if your screens look different, the four sections referenced —
+**Branding**, **Audience**, **Data access**, **Clients** — are the ones to look for).
+
+### A. Enable the Gmail API
 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com) and open the
    **same project** your `credentials.json` service account belongs to (or a new one —
    either works, Gmail OAuth is independent of the Sheets service account).
 2. **APIs & Services → Library** → search **Gmail API** → **Enable**.
 
-### 2. Configure the OAuth consent screen
+### B. Branding
 
-1. **APIs & Services → OAuth consent screen**.
-2. User type: **External** is fine — keep publishing status as **Testing** (this is a
-   personal single-user tool; Testing mode skips Google's app-verification process,
-   which is only required for public-facing apps, and supports up to 100 test users).
-3. Under **Test users**, add your own Gmail address.
-4. Scopes: you don't need to add `gmail.readonly` here — the app requests it directly
-   at login time (see below). Leave scopes as-is.
+Go to **Google Auth Platform → Branding**. For this personal, Testing-mode setup:
 
-### 3. Create an OAuth Client ID
+| Field | Value |
+|---|---|
+| App name | `Job Tracker` |
+| User support email | your Google account |
+| Application home page | **leave blank** |
+| Privacy policy | leave blank |
+| Terms of Service | leave blank |
+| Authorized domains | **leave blank** |
+| Developer contact information | your Google account |
 
-1. **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
-2. Application type: **Web application**.
-3. Under **Authorized redirect URIs**, add *both* (you can use the app locally and on
-   Streamlit Cloud with the same client):
-   - `http://localhost:8501`
-   - `https://your-app-name.streamlit.app` (your actual deployed Streamlit Cloud URL)
-4. Save. Copy the **Client ID** and **Client secret**.
+**Important — leave the domain fields empty.** Don't put `streamlit.app` into
+Authorized domains: Google rejects it, because `streamlit.app` is a shared public
+suffix (many apps live under it), not a private domain this project owns. Don't put
+`https://my-job-tracker.streamlit.app` into Application home page either — doing so
+makes Google require its domain to be added under Authorized domains, which hits the
+exact same rejection. For a personal Testing-mode app none of these fields are
+required, so the simplest fix is to leave them all blank.
 
-### 4. Add the secrets
+### C. Audience
+
+Go to **Google Auth Platform → Audience**.
+
+- **User type**: External
+- **Publishing status**: **Testing** — do not publish
+- **Test users**: add the Gmail account the tracker should read (your own)
+
+While the app stays in Testing, only accounts listed as test users can authorize it —
+that's the whole access boundary, and it's sufficient for a single-user tool.
+
+### D. Data access
+
+Go to **Google Auth Platform → Data access → Add or remove scopes**, and add exactly
+one:
+
+| Scope | User-facing description |
+|---|---|
+| `https://www.googleapis.com/auth/gmail.readonly` | View your email messages and settings |
+
+Google currently lists `gmail.readonly` as a **restricted** Gmail scope — that's
+expected, not a misconfiguration. Do **not** add `gmail.modify`, `gmail.send`,
+`gmail.compose`, or similar — this app never sends, deletes, or modifies mail. In
+particular, don't confuse `gmail.readonly` with
+`gmail.addons.current.message.readonly` — that one is for building Gmail Add-ons and
+is not what this tracker needs.
+
+### E. Create the OAuth client
+
+Go to **Google Auth Platform → Clients → Create client**.
+
+| Field | Value |
+|---|---|
+| Application type | **Web application** |
+| Name | `Job Tracker Streamlit` |
+| Authorized JavaScript origins | leave empty |
+| Authorized redirect URIs | `https://my-job-tracker.streamlit.app` |
+
+For local development you can optionally also add `http://localhost:8501` as a second
+redirect URI on the same client. Whichever URI you use, the app's own
+`GOOGLE_GMAIL_REDIRECT_URI` secret must match it **exactly** — trailing slash and all.
+
+After creating the client, Google shows a **Client ID** and **Client secret**. Copy
+both now — neither belongs in Git; they only ever go into Streamlit Secrets or your
+local `.env`.
+
+### F. Add the secrets
 
 Locally, in `.env`:
 
@@ -234,60 +308,95 @@ GOOGLE_GMAIL_CLIENT_SECRET=your-client-secret
 GOOGLE_GMAIL_REDIRECT_URI=http://localhost:8501
 ```
 
-On Streamlit Cloud, in the same **Secrets** box as step 3 of the deploy section above,
-add the same three keys but with `GOOGLE_GMAIL_REDIRECT_URI` set to your deployed app's
-own URL (must exactly match one of the redirect URIs you registered above).
+On Streamlit Cloud, alongside the secrets from the deploy section above:
 
-### 5. First login
+```toml
+APP_PASSWORD = "replace-with-a-strong-random-password"
 
-Open the **📦 Bulk Email Update** tab and click **Connect Gmail**. You'll see Google's
-consent screen naming exactly one permission — *"Read your email messages and
-settings"* (the `gmail.readonly` scope) — nothing about sending, deleting, or managing
-labels is ever requested. Since the app is in Testing mode, Google will show an
-"unverified app" warning; that's expected for a personal tool only you use — click
-**Advanced → Go to (app name) (unsafe)** to proceed. After granting access you're
-redirected back to the app already connected.
+OPENROUTER_API_KEY = "sk-or-v1-..."
+GROQ_API_KEY = "gsk_..."
 
-### Where the Gmail token is stored (and why)
+GOOGLE_GMAIL_CLIENT_ID = "your-client-id.apps.googleusercontent.com"
+GOOGLE_GMAIL_CLIENT_SECRET = "your-client-secret"
+GOOGLE_GMAIL_REDIRECT_URI = "https://my-job-tracker.streamlit.app"
 
-The refresh token is stored in a **hidden worksheet tab** (`_gmail_oauth_token`) in the
-same spreadsheet, not in a local file. Streamlit Cloud's local disk is wiped on every
-redeploy (which happens on every git push to this repo), so a local token file would
-force you to reconnect Gmail almost every time you pushed a change. The service account
-that already reads/writes this entire spreadsheet is the same one that can read this
-hidden tab, so this doesn't expand what's already trusted with your data — it's just
-one more (hidden, out of your normal tabs' way) worksheet. The token is never logged or
-shown in the UI. Click **Disconnect** in the tab to clear it at any time.
+career_profile = """..."""
 
-### Testing safely — how to scan without changing anything
+[gcp_service_account]
+...
+```
 
-Scanning is always read-only by construction — `scan_period()` (in `gmail_bulk.py`)
-never calls the functions that write to Sheets; only the **Apply Approved Updates**
-button does, and only for rows you've explicitly marked **Approve**. To try a 2025 scan
-without risk:
+`GOOGLE_GMAIL_REDIRECT_URI` here must be `https://my-job-tracker.streamlit.app` — the
+same URI registered on the client in step E. `APP_PASSWORD` and
+`GOOGLE_GMAIL_CLIENT_SECRET` both go **only** into Streamlit Secrets / your local
+environment — never into a file that gets committed to GitHub.
 
-1. Connect Gmail, select **Period: 2025**, leave the label as `Jobsearch` (or your own
-   label), click **Scan Gmail**.
-2. Review the summary and the grouped proposals — expand a few, check the
-   current-vs-proposed fields.
-3. Stop there. As long as you don't click **Apply Approved Updates**, your Google Sheet
-   is untouched — you can verify this yourself by checking the sheet's revision history
-   in Google Sheets (File → Version history) before and after scanning.
-4. Re-running the same scan is safe too — a lightweight **Email Import Log** worksheet
-   (auto-created, visible in your sheet tabs) tracks which Gmail messages were already
-   *applied* (not merely scanned), so a repeat scan skips them and won't duplicate
-   comments or re-bill the AI for emails you've already processed.
+### G. First connection
+
+1. Open Job Tracker and log in with your application password.
+2. Open the **📦 Bulk Email Update** tab.
+3. Click **Connect Gmail**.
+4. Sign into the Gmail account you added as a test user.
+5. Approve the read-only Gmail access Google's consent screen asks for.
+6. You're redirected back to Job Tracker.
+7. The tab should now show **Gmail: ✅ Connected**.
+
+(Google's own consent-screen wording and any "unverified app" warning can vary by
+account and by when you're reading this — if you see one, it's expected for a personal
+Testing-mode app only you use; there isn't one exact screen to guarantee here.)
+
+### H. Safe first test
+
+Before trusting it with your full history, run a small, conservative test:
+
+1. Select **Custom range** and pick roughly the last **7–14 days**.
+2. Leave the Gmail label as `Jobsearch` (or set it to whatever label you actually use).
+3. Click **Scan Gmail**.
+4. Review the proposals in the review queue.
+5. **Do not click Apply Approved Updates yet.**
+6. Confirm your Google Sheet is unchanged — check its revision history (File → Version
+   history) before and after the scan, or just glance at the rows you'd expect to be
+   affected.
+
+Once you're happy with what a small scan proposes, expand to larger periods (the full
+**2025** archive, or **Jan–Jul 2026**) with more confidence.
+
+**Scan Gmail is read-only with respect to application rows, always** — `scan_period()`
+in `gmail_bulk.py` never calls the functions that write to Sheets. Only **Apply
+Approved Updates** may write, and only for items you've explicitly marked **Approve**.
+
+### Other things worth knowing
+
+- **Own sent messages are skipped before the AI ever sees them** — the app looks up
+  your own Gmail address (`users().getProfile`) once per scan and filters out anything
+  sent from it, deterministically, with no LLM cost.
+- **Ambiguous matches** always show enough detail (company, role, status, date applied)
+  on every candidate row to pick correctly — never auto-selected.
+- **Proposed comments are editable** in the review screen before you approve — your
+  edited text is what gets written, not the AI's original wording; existing Company
+  Comments are always shown alongside and are never erased.
+- **2025 vs. current-year routing**: a scanned email dated in 2025 is matched and
+  updated against the **2025** worksheet tab; anything else uses your current-year
+  sheet — the same routing **Update from Email** already uses.
+- **Email Import Log**: a worksheet (auto-created, visible in your sheet tabs) records
+  each Gmail message only *after* its update/creation is successfully applied — never
+  merely for being scanned. Re-scanning the same period skips already-applied messages,
+  so nothing gets duplicated and nothing gets re-billed to the AI.
+- **Where the Gmail token is stored**: a **hidden worksheet tab** (`_gmail_oauth_token`)
+  in the same spreadsheet, not local disk — Streamlit Cloud wipes local disk on every
+  redeploy (which happens on every git push to this repo), so a local token file would
+  force reconnecting almost every time you pushed a change. The service account that
+  already reads/writes this whole spreadsheet is the same one that can read this hidden
+  tab, so this doesn't expand what was already trusted with your data. The token is
+  never logged or shown in the UI. Click **Disconnect** in the tab to clear it anytime.
 
 ### Known limitations
 
-- The OAuth `state` parameter isn't cross-validated on the callback — acceptable for a
-  single-user personal tool behind its own password gate, but worth knowing if you ever
-  expose this app more broadly.
 - Large scans page through Gmail's API sequentially (list + fetch per message, no batch
   requests yet) — hundreds of messages will take a while but will complete.
 - The Gmail label filter matches Gmail's own `label:"..."` search syntax; if your label
-  name has changed, update the label field in the Bulk Email Update tab (it doesn't have
-  to be `Jobsearch`, that's just the default).
+  name differs, change the label field in the Bulk Email Update tab (it doesn't have to
+  be `Jobsearch`, that's just the default).
 
 ---
 

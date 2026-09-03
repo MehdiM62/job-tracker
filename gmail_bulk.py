@@ -103,36 +103,49 @@ def build_flow() -> Flow:
 
 def get_authorization_url() -> str:
     flow = build_flow()
-    auth_url, _state = flow.authorization_url(
+    auth_url, state = flow.authorization_url(
         access_type="offline", include_granted_scopes="true", prompt="consent"
     )
+    # Stored so the callback below can confirm the redirect it's handling actually
+    # corresponds to an OAuth flow THIS browser session started, not a replayed or
+    # forged callback URL.
+    st.session_state["gmail_oauth_state"] = state
     return auth_url
 
 
 def handle_oauth_callback() -> None:
-    """Call once, early in main(), before any tab renders. No-ops instantly unless the
-    URL actually carries a fresh ?code=... from Google's redirect."""
+    """Call once, early in main() — AFTER the Job Tracker password gate — before any
+    tab renders. No-ops instantly unless the URL actually carries a fresh ?code=...
+    from Google's redirect. Callers must ensure this only ever runs for an already-
+    authenticated session: Gmail OAuth and Job Tracker login are separate concerns, and
+    a bare callback URL must never grant tracker access by itself."""
     if not is_configured():
         return
     code = st.query_params.get("code")
     if not code:
         return
+    incoming_state = st.query_params.get("state")
+    expected_state = st.session_state.pop("gmail_oauth_state", None)
     try:
-        flow = build_flow()
-        flow.fetch_token(code=code)
-        creds = flow.credentials
-        _save_stored_token_json(creds.to_json())
-        st.session_state["gmail_creds_cache"] = creds
-        st.session_state["flash"] = ("success", "✅ Gmail connected — read-only access granted.")
+        if not expected_state or incoming_state != expected_state:
+            st.session_state["flash"] = (
+                "error",
+                "Gmail connection failed: this authorization link couldn't be verified "
+                "(state mismatch) — please click Connect Gmail again.",
+            )
+        else:
+            flow = build_flow()
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            _save_stored_token_json(creds.to_json())
+            st.session_state["gmail_creds_cache"] = creds
+            st.session_state["flash"] = ("success", "✅ Gmail connected — read-only access granted.")
     except Exception as e:
         st.session_state["flash"] = ("error", f"Gmail connection failed: {e}")
     finally:
         st.query_params.pop("code", None)
         st.query_params.pop("state", None)
         st.query_params.pop("scope", None)
-        # Google's redirect_uri is a fixed bare URL — restore the app's own login param
-        # so landing back here doesn't re-trigger the password gate.
-        st.query_params["pw"] = app.APP_PASSWORD
         st.rerun()
 
 
