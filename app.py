@@ -653,6 +653,16 @@ def _mark_submitted(signature: tuple) -> None:
     st.session_state["last_submission_sig"] = signature
 
 
+def _flash(kind: str, text: str) -> None:
+    """Queues a message (st.error/st.warning/st.info's `kind`) to be shown at the top of
+    the NEXT run instead of inline right now. Needed anywhere a busy-flag block clears its
+    flag and needs to report a problem: a bare st.error() call here would render into
+    *this* run's output, but a disabled button rendered earlier in this same run needs one
+    more rerun to redraw as enabled again — st.rerun() throws that output away, so the
+    message has to survive in session_state to be shown after."""
+    st.session_state["flash"] = (kind, text)
+
+
 def append_job(data: dict) -> int:
     """Inserts the job at the sheet position that keeps Date Applied ascending —
     appends at the bottom if the date is newest (the common case), otherwise inserts
@@ -843,6 +853,10 @@ def main():
         st.success(st.session_state.pop("success_msg"))
         st.balloons()
 
+    if "flash" in st.session_state:
+        _kind, _text = st.session_state.pop("flash")
+        getattr(st, _kind)(_text)
+
     # A key makes the active tab a stateful widget tracked in session_state — without
     # one, Streamlit relies on fragile client-side-only memory to keep the same tab
     # selected across reruns, which intermittently resets to the first tab (e.g. right
@@ -868,14 +882,16 @@ def main():
                     try:
                         ws = get_worksheet()
                         result = normalize_sheet_formatting(ws)
-                        st.success(
+                        _flash(
+                            "success",
                             f"✅ Scanned {result['rows_scanned']} rows — "
-                            f"fixed bullets on {result['bullets_fixed']} row(s)."
+                            f"fixed bullets on {result['bullets_fixed']} row(s).",
                         )
                     except Exception as e:
-                        st.error(f"Normalization failed: {e}")
+                        _flash("error", f"Normalization failed: {e}")
                     finally:
                         st.session_state["normalizing"] = False
+                        st.rerun()
 
         _restore_fetch_snapshot_if_needed()
 
@@ -936,19 +952,22 @@ def main():
                             html = fetch_url(_url)
                             text = html_to_text(html)
                             if len(text) < 100:
-                                st.warning("Page content looks too short — try pasting manually.")
+                                _flash("warning", "Page content looks too short — try pasting manually.")
                                 st.session_state["fetch_stage"] = None
-                                st.stop()
+                                st.rerun()
                         except RuntimeError as e:
-                            st.error(f"Could not fetch the page: {e}")
-                            st.info("Use the **paste manually** option above instead.")
+                            _flash(
+                                "error",
+                                f"Could not fetch the page: {e}\n\n"
+                                "Use the **paste manually** option above instead.",
+                            )
                             st.session_state["fetch_stage"] = None
-                            st.stop()
+                            st.rerun()
 
                 if not text:
-                    st.warning("Enter a URL or paste the job description.")
+                    _flash("warning", "Enter a URL or paste the job description.")
                     st.session_state["fetch_stage"] = None
-                    st.stop()
+                    st.rerun()
 
                 st.session_state["fetch_text_content"] = text
                 st.session_state["llm_providers_used"] = []  # reset before this batch of AI calls
@@ -967,13 +986,13 @@ def main():
                         st.session_state.pop("match_result", None)
                         st.session_state.pop("match_error", None)
                     except json.JSONDecodeError:
-                        st.error("AI returned unexpected output. Try again.")
+                        _flash("error", "AI returned unexpected output. Try again.")
                         st.session_state["fetch_stage"] = None
-                        st.stop()
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"Parsing failed: {e}")
+                        _flash("error", f"Parsing failed: {e}")
                         st.session_state["fetch_stage"] = None
-                        st.stop()
+                        st.rerun()
                 _save_fetch_snapshot()
                 st.session_state["fetch_stage"] = "match"
                 st.rerun()
@@ -1161,9 +1180,9 @@ def main():
                 try:
                     datetime.strptime(date_applied.strip(), "%Y-%m-%d %H:%M")
                 except ValueError:
-                    st.error("Date Applied must be in YYYY-MM-DD HH:MM format.")
+                    _flash("error", "Date Applied must be in YYYY-MM-DD HH:MM format.")
                     st.session_state["adding_job"] = False
-                    st.stop()
+                    st.rerun()
 
                 sig = ("add_job", company.strip().lower(), role.strip().lower(), job_url.strip(), date_applied.strip())
                 if _is_duplicate_submission(sig):
@@ -1197,11 +1216,13 @@ def main():
                         st.session_state["adding_job"] = False
                         st.rerun()
                     except FileNotFoundError as e:
-                        st.error(str(e))
+                        _flash("error", str(e))
                         st.session_state["adding_job"] = False
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"Failed to write to sheet: {e}")
+                        _flash("error", f"Failed to write to sheet: {e}")
                         st.session_state["adding_job"] = False
+                        st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 2 — Update from Email
@@ -1233,32 +1254,35 @@ def main():
             st.rerun()
 
         if st.session_state.get("parsing_email"):
-            try:
-                email_body = st.session_state.get("pending_email_text", "")
-                with st.spinner("Loading your applications..."):
-                    try:
-                        ws = get_worksheet()
-                        jobs = get_all_jobs(ws)
-                        if not jobs:
-                            st.error("No job applications found in the sheet yet.")
-                            st.stop()
-                    except Exception as e:
-                        st.error(f"Could not load sheet: {e}")
-                        st.stop()
+            email_body = st.session_state.get("pending_email_text", "")
+            with st.spinner("Loading your applications..."):
+                try:
+                    ws = get_worksheet()
+                    jobs = get_all_jobs(ws)
+                    if not jobs:
+                        _flash("error", "No job applications found in the sheet yet.")
+                        st.session_state["parsing_email"] = False
+                        st.rerun()
+                except Exception as e:
+                    _flash("error", f"Could not load sheet: {e}")
+                    st.session_state["parsing_email"] = False
+                    st.rerun()
 
-                st.session_state["llm_providers_used"] = []  # reset before this AI call
+            st.session_state["llm_providers_used"] = []  # reset before this AI call
 
-                with st.spinner("Parsing email with AI..."):
-                    try:
-                        result = parse_email(email_body, jobs)
-                        st.session_state["email_parsed"] = result
-                        st.session_state["email_jobs"] = jobs
-                        st.session_state["email_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
-                    except Exception as e:
-                        st.error(f"Parsing failed: {e}")
-                        st.stop()
-            finally:
-                st.session_state["parsing_email"] = False
+            with st.spinner("Parsing email with AI..."):
+                try:
+                    result = parse_email(email_body, jobs)
+                    st.session_state["email_parsed"] = result
+                    st.session_state["email_jobs"] = jobs
+                    st.session_state["email_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
+                except Exception as e:
+                    _flash("error", f"Parsing failed: {e}")
+                    st.session_state["parsing_email"] = False
+                    st.rerun()
+
+            st.session_state["parsing_email"] = False
+            st.rerun()
 
         if "email_parsed" in st.session_state:
             r = st.session_state["email_parsed"]
@@ -1367,9 +1391,9 @@ def main():
                     try:
                         datetime.strptime(new_date.strip(), "%Y-%m-%d %H:%M")
                     except ValueError:
-                        st.error("Date Applied must be in YYYY-MM-DD HH:MM format.")
+                        _flash("error", "Date Applied must be in YYYY-MM-DD HH:MM format.")
                         st.session_state["adding_from_email"] = False
-                        st.stop()
+                        st.rerun()
 
                     sig = ("add_from_email", new_company.strip().lower(), new_role.strip().lower(), new_date.strip())
                     if _is_duplicate_submission(sig):
@@ -1398,8 +1422,9 @@ def main():
                             st.session_state["adding_from_email"] = False
                             st.rerun()
                         except Exception as e:
-                            st.error(f"Failed to add: {e}")
+                            _flash("error", f"Failed to add: {e}")
                             st.session_state["adding_from_email"] = False
+                            st.rerun()
 
             else:
                 selected_row_no = job_options[selected_label]
@@ -1454,11 +1479,13 @@ def main():
                                 st.session_state["updating_sheet"] = False
                                 st.rerun()
                             else:
-                                st.error(f"Row #{selected_row_no} not found in the sheet.")
+                                _flash("error", f"Row #{selected_row_no} not found in the sheet.")
                                 st.session_state["updating_sheet"] = False
+                                st.rerun()
                         except Exception as e:
-                            st.error(f"Failed to update sheet: {e}")
+                            _flash("error", f"Failed to update sheet: {e}")
                             st.session_state["updating_sheet"] = False
+                            st.rerun()
 
 
 if __name__ == "__main__":
