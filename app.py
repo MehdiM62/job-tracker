@@ -453,12 +453,15 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list, email_da
     rejected attempt) does the role also need to match, so as not to silently point at
     the wrong one.
 
-    If the company text doesn't even partially match any row (e.g. the email spells out
-    a full legal name, abbreviation, or translation the sheet's normalized Company string
-    doesn't overlap with as a substring), falls back to matching on an exact role title
-    alone across every date-eligible row regardless of company — but only trusts that
-    when it's the ONE row with that exact title, so a generic title reused across several
-    different tracked companies stays ambiguous rather than being guessed.
+    If the company text doesn't even partially match any row, that's reported as no
+    match rather than falling back to matching on role title alone — a shared role title
+    ("Agile Coach", "Product Owner") with NO company signal in common is not a candidate
+    worth surfacing, it's just as likely (often more likely) two unrelated companies that
+    happen to use the same generic title. Company similarity is deliberately the one
+    thing this function won't compromise on: some keyword has to overlap (an added/
+    dropped legal suffix like "GmbH"/"Group", or a shortened form, is fine — see
+    normalize_company/_company_role_match — but a completely different company sharing
+    a common role title is not).
 
     Returns (row_no, ambiguous_row_nos): row_no is the resolved match, or None if no
     single row could be picked. ambiguous_row_nos is non-empty only when two or more
@@ -481,18 +484,11 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list, email_da
             return co_matches[0].get("No."), []
 
     if not co_matches:
-        # Company text gave no substring signal at all — fall back to role-only, but
-        # only act on it when the exact title is unique across the whole eligible pool.
-        # A generic title ("Product Owner") can legitimately be tied across a dozen+
-        # different companies once company isn't narrowing anything down — past a small
-        # handful of ties that's noise, not a useful set of candidates to show, so treat
-        # it the same as no match rather than dumping a huge row list on the user.
-        if len(target_role) >= 4:
-            role_exact = [j for j in jobs if normalize_role(str(j.get("Role", ""))) == target_role]
-            if len(role_exact) == 1:
-                return role_exact[0].get("No."), []
-            if 1 < len(role_exact) <= 8:
-                return None, sorted({j.get("No.") for j in role_exact})
+        # No company keyword overlap with anything tracked — most often because this
+        # genuinely isn't tracked yet, not because of a wording mismatch. Matching on
+        # role title alone here previously caused false positives (e.g. "Agile Coach"
+        # at a company you never applied to matching a same-titled row at a totally
+        # unrelated one), so this stays a clean "no match" rather than guessing.
         return None, []
 
     if len(target_role) < 4:
