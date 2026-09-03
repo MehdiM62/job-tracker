@@ -502,6 +502,7 @@ def _build_group(kind: str, key: tuple, items: list) -> dict:
         "current_status": "",
         "current_contact": "",
         "current_company_comments": "",
+        "ambiguous_row_details": {},
     }
 
     if kind == "matched":
@@ -523,6 +524,24 @@ def _build_group(kind: str, key: tuple, items: list) -> dict:
                 group["conflict"] = True
 
     if group["ambiguous_rows"]:
+        # Pull enough detail from the target worksheet to tell candidate rows apart —
+        # "Row 183" and "Row 397" alone aren't enough to safely pick between two
+        # similar applications.
+        try:
+            jobs = app.get_all_jobs(app.get_worksheet(target_sheet))
+        except Exception:
+            jobs = []
+        for no in group["ambiguous_rows"]:
+            row = next((j for j in jobs if str(j.get("No.")) == str(no)), None)
+            if row:
+                group["ambiguous_row_details"][no] = {
+                    "company": row.get("Company", ""),
+                    "role": row.get("Role", ""),
+                    "status": row.get("Status", ""),
+                    "date_applied": row.get("Date Applied", ""),
+                    "contact": row.get("Contact Person", ""),
+                    "company_comments": row.get("Company Comments", ""),
+                }
         group["bucket"] = "review"
     elif kind == "matched":
         group["bucket"] = "high" if (group["status_confidence"] == "high" and not group["conflict"]) else "review"
@@ -821,16 +840,58 @@ def _render_group(g: dict) -> None:
         treat_as_new = g["kind"] == "new"
         if g["ambiguous_rows"]:
             st.caption("Multiple tracked rows look like a match — pick the correct one, or leave unselected to skip:")
-            options = ["— select —"] + [f"Row {n}" for n in g["ambiguous_rows"]]
+            details = g.get("ambiguous_row_details", {})
+
+            def _row_label(no):
+                d = details.get(no)
+                if not d:
+                    return f"Row {no}"
+                return f"Row {no} — {d['company']} | {d['role']} | {d['status']} | {d['date_applied']}"
+
+            options = ["— select —"] + [_row_label(n) for n in g["ambiguous_rows"]]
             choice = st.selectbox("Match to row", options, key=f"bulk_row_pick_{gk}")
-            selected_row = int(choice.split()[1]) if choice != "— select —" else None
+            if choice == "— select —":
+                selected_row = None
+            else:
+                # Always the actual No. value from ambiguous_rows, never parsed back
+                # out of the display label — the label is presentation only.
+                selected_row = g["ambiguous_rows"][options.index(choice) - 1]
+                picked = details.get(selected_row)
+                if picked:
+                    st.markdown(f"**Selected row's current Status:** {picked['status'] or '_(none)_'}")
+                    st.markdown(f"**Selected row's current Contact Person:** {picked['contact'] or '_(none)_'}")
+                    if picked["company_comments"].strip():
+                        st.text_area(
+                            "Selected row's Company Comments", value=picked["company_comments"],
+                            key=f"bulk_amb_comments_{gk}", disabled=True, height=100,
+                            label_visibility="collapsed",
+                        )
+                    else:
+                        st.caption("_(no existing Company Comments)_")
         elif g["kind"] == "single" and g["matched_row"] is None:
             st.caption("No tracked application found for this company/role.")
             treat_as_new = st.checkbox(
                 "Treat as a new application (create a row)", key=f"bulk_treat_new_{gk}", value=False,
             )
 
-        edited_status = st.text_input("Status (edit if needed)", value=g["proposed_status"], key=f"bulk_status_ov_{gk}")
+        status_options = list(app.STATUSES)
+        proposed_status = g["proposed_status"]
+        status_invalid = proposed_status not in status_options
+        if not status_invalid:
+            default_status_idx = status_options.index(proposed_status)
+        elif g["current_status"] in status_options:
+            # Safest fallback: don't guess a new status at all, propose no change.
+            default_status_idx = status_options.index(g["current_status"])
+        else:
+            default_status_idx = status_options.index("Applied")
+        if status_invalid:
+            st.warning(
+                f"⚠️ The AI returned an unrecognized status ('{proposed_status or 'empty'}') — "
+                f"defaulted to **{status_options[default_status_idx]}** below. Please verify before approving."
+            )
+        edited_status = st.selectbox(
+            "Status (edit if needed)", status_options, index=default_status_idx, key=f"bulk_status_ov_{gk}",
+        )
         edited_contact = st.text_input("Contact (edit if needed)", value=g["proposed_contact"], key=f"bulk_contact_ov_{gk}")
 
         can_approve = bool(selected_row) or treat_as_new
