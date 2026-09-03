@@ -96,7 +96,19 @@ def build_flow() -> Flow:
             "redirect_uris": [redirect_uri],
         }
     }
-    flow = Flow.from_client_config(client_config, scopes=GMAIL_SCOPES)
+    # PKCE deliberately disabled: google-auth-oauthlib auto-generates a code_verifier
+    # per Flow *instance* and only that same instance's fetch_token() has it in memory.
+    # get_authorization_url() and handle_oauth_callback() each build their own Flow via
+    # this function — often across a full page redirect to Google and back, sometimes
+    # even across a re-login after Streamlit Cloud's session didn't survive that trip —
+    # so a verifier generated on one instance is never available to the other, and
+    # Google rejects the exchange with "(invalid_grant) Missing code verifier" (this
+    # was a real bug here, not a hypothetical). PKCE exists to protect public clients
+    # that can't hold a secret; this is a confidential "Web application" client that
+    # already authenticates the token exchange with client_secret, so it doesn't need
+    # PKCE on top — disabling it removes the requirement to carry a verifier across
+    # requests/sessions at all.
+    flow = Flow.from_client_config(client_config, scopes=GMAIL_SCOPES, autogenerate_code_verifier=False)
     flow.redirect_uri = redirect_uri
     return flow
 
