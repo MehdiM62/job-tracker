@@ -63,6 +63,10 @@ QUOTE_MARKERS = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Pulls the bare address out of a "From" header like "Jane Doe <jane@x.com>" — falls
+# back to the raw header value if there's no <...> wrapper.
+FROM_ADDR_RE = re.compile(r"<([^<>]+)>")
+
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -240,6 +244,24 @@ def build_gmail_service(creds):
     return _gbuild("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
+def get_own_email_address(service) -> str:
+    """The authenticated account's own address, via users().getProfile — used to skip
+    our own sent messages (e.g. a reply inside a labeled recruiter thread) before they
+    ever reach the LLM. Returns "" if the profile call fails for any reason; callers
+    should treat that as "can't verify, don't filter" rather than fail the whole scan."""
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        return (profile.get("emailAddress") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _parse_email_address(header_value: str) -> str:
+    m = FROM_ADDR_RE.search(header_value or "")
+    addr = m.group(1) if m else (header_value or "")
+    return addr.strip().lower()
+
+
 def _period_bounds(period: str, custom_start: date | None, custom_end: date | None) -> tuple:
     if period == PERIOD_2025:
         return date(2025, 1, 1), date(2026, 1, 1)
@@ -352,10 +374,12 @@ def scan_period(creds, label: str, start: date, end: date) -> dict:
     service = build_gmail_service(creds)
     query = build_query(label, start, end)
     processed_ids = load_processed_ids()
+    own_email = get_own_email_address(service)
 
     ids = list_message_ids(service, query)
     results, failures = [], []
     skipped = 0
+    sent_skipped = 0
     jobs_cache: dict = {}
 
     for msg_id in ids:
@@ -367,6 +391,17 @@ def scan_period(creds, label: str, start: date, end: date) -> dict:
         try:
             msg = fetch_message(service, msg_id)
             subject_for_error = msg.get("subject", "")
+        except Exception as e:
+            failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e)})
+            continue
+
+        # Deterministic, no LLM cost: our own replies inside a labeled recruiter thread
+        # (e.g. "thanks for the update") aren't job-status signals worth extracting.
+        if own_email and _parse_email_address(msg["from"]) == own_email:
+            sent_skipped += 1
+            continue
+
+        try:
             email_text = build_email_text(msg)
             info = app.extract_email_info(email_text)
         except Exception as e:
@@ -399,7 +434,10 @@ def scan_period(creds, label: str, start: date, end: date) -> dict:
             "info": info,
         })
 
-    return {"results": results, "failures": failures, "skipped_processed": skipped, "scanned": len(ids)}
+    return {
+        "results": results, "failures": failures, "skipped_processed": skipped,
+        "sent_skipped": sent_skipped, "scanned": len(ids),
+    }
 
 
 # ── Grouping & proposals ─────────────────────────────────────────────────────
@@ -520,6 +558,7 @@ def group_results(results: list) -> list:
 def _apply_matched(group: dict, row_no: int, target_sheet, overrides: dict) -> dict:
     applied = 0
     items = group["items"]
+    comment_overrides = overrides.get("comments") or {}
     for idx, item in enumerate(items):
         info = dict(item["info"])
         if idx == len(items) - 1:
@@ -527,9 +566,13 @@ def _apply_matched(group: dict, row_no: int, target_sheet, overrides: dict) -> d
                 info["new_status"] = overrides["status"]
             if overrides.get("contact"):
                 info["contact_person"] = overrides["contact"]
+        # The user may have edited this email's proposed comment text in the review
+        # screen — that edited text, not the original AI extraction, is what's applied.
+        comment_text = comment_overrides.get(item["message_id"], info.get("company_comments", ""))
+        info["company_comments"] = comment_text
         try:
             ok, _filled = app.update_job_from_email(
-                row_no, info.get("new_status", ""), info.get("company_comments", ""),
+                row_no, info.get("new_status", ""), comment_text,
                 info.get("email_date", ""), sheet_name=target_sheet, email_info=info,
             )
         except Exception as e:
@@ -548,8 +591,12 @@ def _apply_matched(group: dict, row_no: int, target_sheet, overrides: dict) -> d
 def _apply_new(group: dict, target_sheet, overrides: dict) -> dict:
     items = group["items"]
     earliest = items[0]
+    comment_overrides = overrides.get("comments") or {}
     combined_comments = "\n".join(
-        line for i in items for line in (i["info"].get("company_comments", "") or "").splitlines() if line.strip()
+        line
+        for i in items
+        for line in (comment_overrides.get(i["message_id"], i["info"].get("company_comments", "")) or "").splitlines()
+        if line.strip()
     )
     date_applied = earliest["info"].get("email_datetime", "") or ""
     if not date_applied:
@@ -669,13 +716,19 @@ def _render_scan_controls() -> None:
                 st.session_state["bulk_scan_summary"] = {
                     "scanned": scan["scanned"],
                     "skipped": scan["skipped_processed"],
+                    "sent_skipped": scan["sent_skipped"],
                     "failed": len(scan["failures"]),
                     "high": sum(1 for g in groups if g["bucket"] == "high"),
                     "review": sum(1 for g in groups if g["bucket"] == "review"),
                     "unmatched": sum(1 for g in groups if g["bucket"] == "unmatched"),
                 }
                 st.session_state["bulk_failures"] = scan["failures"]
-                st.session_state.setdefault("bulk_group_decisions", {})
+                # A fresh scan always starts with a fresh decision state — setdefault()
+                # here would let an Approve/Skip/Applied decision from a PREVIOUS scan
+                # leak into this one whenever the same sheet row's group_key recurs
+                # (e.g. the same application matched again), showing it as already
+                # decided before this scan's results were even reviewed.
+                st.session_state["bulk_group_decisions"] = {}
         except Exception as e:
             app._flash("error", f"Gmail scan failed: {e}")
         finally:
@@ -687,7 +740,7 @@ def _render_scan_summary() -> None:
     s = st.session_state["bulk_scan_summary"]
     st.success(
         f"**{s['scanned']} emails scanned** — {s['skipped']} already processed (skipped), "
-        f"{s['failed']} failed to parse.\n\n"
+        f"{s.get('sent_skipped', 0)} sent messages skipped, {s['failed']} failed to parse.\n\n"
         f"🟢 {s['high']} high confidence · 🟡 {s['review']} need review · 🆕 {s['unmatched']} unmatched/new"
     )
     failures = st.session_state.get("bulk_failures", [])
@@ -734,9 +787,6 @@ def _render_group(g: dict) -> None:
                 "review the proposed status carefully before approving."
             )
 
-        for e in g["emails_preview"]:
-            st.caption(f"📧 {e['email_date'] or '?'} — {e['subject']}")
-
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(f"**Current status:** {g['current_status'] or '_(none)_'}")
@@ -744,6 +794,28 @@ def _render_group(g: dict) -> None:
         with c2:
             st.markdown(f"**Proposed status:** {g['proposed_status'] or '_(unchanged)_'}")
             st.markdown(f"**Proposed contact:** {g['proposed_contact'] or '_(none — leaves existing)_'}")
+
+        if g["kind"] == "matched":
+            st.markdown("**Existing Company Comments** (already in the sheet — never erased):")
+            if g["current_company_comments"].strip():
+                st.text_area(
+                    "Existing Company Comments", value=g["current_company_comments"],
+                    key=f"bulk_existing_comments_{gk}", disabled=True, height=100,
+                    label_visibility="collapsed",
+                )
+            else:
+                st.caption("_(none yet)_")
+
+        st.markdown("**Comments that will be appended if approved** — edit any of these before approving:")
+        comment_edits = {}
+        for item in g["items"]:
+            info = item["info"]
+            st.caption(f"📧 {info.get('email_date', '') or '?'} — {item['subject']}")
+            comment_edits[item["message_id"]] = st.text_area(
+                f"Comment for {item['message_id']}", value=info.get("company_comments", ""),
+                key=f"bulk_comment_ov_{gk}_{item['message_id']}", height=80,
+                label_visibility="collapsed",
+            )
 
         selected_row = g["matched_row"]
         treat_as_new = g["kind"] == "new"
@@ -771,6 +843,7 @@ def _render_group(g: dict) -> None:
                     "force_new": treat_as_new,
                     "status": edited_status.strip(),
                     "contact": edited_contact.strip(),
+                    "comments": comment_edits,
                 }
                 st.rerun()
         with b2:
