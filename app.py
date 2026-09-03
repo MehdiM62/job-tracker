@@ -22,6 +22,14 @@ CET = pytz.timezone("Europe/Berlin")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 STATUSES = ["Applied", "Interview", "Assessment", "Offer", "Rejected", "Withdrawn"]
 
+# The spreadsheet has a tab per year — sheet1 (the default get_worksheet() target) is the
+# current year's tab; ARCHIVE_SHEET_NAME is the prior year's, kept around for emails that
+# reference an application tracked there. Only the "Update from Email" flow ever routes to
+# it (see _archive_sheet_for_email_date) — every other flow (Fetch & Parse, Normalize
+# formatting) keeps writing to sheet1 exactly as before.
+ARCHIVE_SHEET_NAME = "2025"
+ARCHIVE_SHEET_YEAR = 2025
+
 # Domain → display name (order matters; first match wins)
 SOURCE_DOMAINS = {
     "linkedin.com":       "LinkedIn",
@@ -317,17 +325,14 @@ def _looks_garbled(result: dict) -> bool:
     return result.get("new_status") not in STATUSES
 
 
-def parse_email(email_text: str, jobs: list) -> dict:
-    # The AI only extracts from the email text itself — no job list is sent. It's
-    # reliably accurate at that (company, role, status, dates, comments), which made
-    # the previous design's job list pointless for every field except matched_row: a
-    # row NUMBER cited out of a long (900+) candidate list, the one thing the model
-    # was NOT reliably accurate at — it could confidently cite the wrong row while
-    # still extracting the right company/role. So matched_row isn't asked of the AI at
-    # all; it's resolved deterministically below via fuzzy_find_job's company+role text
-    # match against the full job history, which is cheap, local, and doesn't share that
-    # failure mode. This also means the prompt no longer scales with sheet size — no
-    # per-provider budget juggling needed.
+def extract_email_info(email_text: str) -> dict:
+    """Extracts structured info from the email via the LLM only — the AI only ever reads
+    the email text itself, no job list is sent. It's reliably accurate at that (company,
+    role, status, dates, comments); matched_row isn't asked of the AI at all — it's
+    resolved deterministically via fuzzy_find_job's company+role text match against the
+    full job history, which the caller runs separately once it knows which worksheet's
+    job history to check (the email's own extracted date decides that — see
+    _archive_sheet_for_email_date — so it isn't known until this call returns)."""
     prompt = _email_extract_prompt(email_text)
     result = call_llm(prompt)
     if _looks_garbled(result):
@@ -338,11 +343,19 @@ def parse_email(email_text: str, jobs: list) -> dict:
     for field in ("status_confidence", "new_application_confidence"):
         if isinstance(result.get(field), str):
             result[field] = result[field].strip().lower()
-    result["matched_row"], result["matched_row_candidates"] = fuzzy_find_job(
-        result.get("matched_company", ""), result.get("matched_role", ""), jobs,
-        email_date=result.get("email_date", ""),
-    )
     return result
+
+
+def _archive_sheet_for_email_date(email_date: str) -> str | None:
+    """Returns ARCHIVE_SHEET_NAME when the email's own date falls in ARCHIVE_SHEET_YEAR,
+    else None (meaning: use the default worksheet, get_worksheet()'s usual sheet1). Only
+    the Update from Email flow calls this — Fetch & Parse and every other flow always
+    targets the default sheet, unaffected by any date."""
+    try:
+        year = datetime.strptime((email_date or "").strip(), "%Y-%m-%d").year
+    except ValueError:
+        return None
+    return ARCHIVE_SHEET_NAME if year == ARCHIVE_SHEET_YEAR else None
 
 
 CORP_SUFFIX_RE = re.compile(r"\b(gmbh|se|ag|inc|ltd|llc|kg|corp|corporation|plc|co)\b")
@@ -538,7 +551,10 @@ Analyse how well the candidate fits this job and return ONLY a JSON object:
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 
-def get_worksheet():
+def get_worksheet(sheet_name: str | None = None):
+    """sheet_name selects a specific tab by title (e.g. the "2025" archive tab);
+    omitted/None keeps the existing default of the spreadsheet's first tab (the current
+    year's sheet), so every call site that doesn't pass it behaves exactly as before."""
     try:
         info = dict(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -551,7 +567,8 @@ def get_worksheet():
             )
         creds = Credentials.from_service_account_file(path, scopes=SCOPES)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(SHEET_ID).sheet1
+    sh = gc.open_by_key(SHEET_ID)
+    return sh.worksheet(sheet_name) if sheet_name else sh.sheet1
 
 
 EXTRA_COLS = ["Company Comments", "Match Level", "Missing Skills"]
@@ -723,11 +740,13 @@ def _flash(kind: str, text: str) -> None:
     st.session_state["flash"] = (kind, text)
 
 
-def append_job(data: dict) -> int:
+def append_job(data: dict, sheet_name: str | None = None) -> int:
     """Inserts the job at the sheet position that keeps Date Applied ascending —
     appends at the bottom if the date is newest (the common case), otherwise inserts
-    in the middle and renumbers every row pushed down so No. stays sequential."""
-    ws = get_worksheet()
+    in the middle and renumbers every row pushed down so No. stays sequential.
+    sheet_name targets a specific tab (e.g. the "2025" archive); omitted keeps the
+    existing default of the current-year sheet1."""
+    ws = get_worksheet(sheet_name)
     ensure_extra_cols(ws)
     all_rows = ws.get_all_values()
     data_rows = [r for r in all_rows[1:] if any(cell.strip() for cell in r)]
@@ -779,11 +798,12 @@ def append_job(data: dict) -> int:
     return new_no
 
 
-def update_job_from_email(row_no: int, new_status: str, company_comments: str, email_date: str) -> bool:
+def update_job_from_email(row_no: int, new_status: str, company_comments: str, email_date: str, sheet_name: str | None = None) -> bool:
     """Applies an email-derived update as a new dated history entry appended to
     Company Comments — prior entries (status changes, interview steps, etc.)
-    are preserved rather than overwritten."""
-    ws = get_worksheet()
+    are preserved rather than overwritten. sheet_name targets a specific tab (e.g. the
+    "2025" archive); omitted keeps the existing default of the current-year sheet1."""
+    ws = get_worksheet(sheet_name)
     col_map = ensure_extra_cols(ws)
     all_values = ws.get_all_values()
     header = all_values[0]
@@ -1315,12 +1335,30 @@ def main():
 
         if st.session_state.get("parsing_email"):
             email_body = st.session_state.get("pending_email_text", "")
+            st.session_state["llm_providers_used"] = []  # reset before this AI call
+
+            with st.spinner("Parsing email with AI..."):
+                try:
+                    result = extract_email_info(email_body)
+                    st.session_state["email_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
+                except Exception as e:
+                    _flash("error", f"Parsing failed: {e}")
+                    st.session_state["parsing_email"] = False
+                    st.rerun()
+
+            # The email's own date decides which worksheet tab to match/update against —
+            # a 2025-dated email refers to a row tracked in the "2025" archive tab, not
+            # the current-year sheet. Only resolvable now, after extraction, since the
+            # date comes from the AI's own reading of the email.
+            target_sheet = _archive_sheet_for_email_date(result.get("email_date", ""))
+
             with st.spinner("Loading your applications..."):
                 try:
-                    ws = get_worksheet()
+                    ws = get_worksheet(target_sheet)
                     jobs = get_all_jobs(ws)
                     if not jobs:
-                        _flash("error", "No job applications found in the sheet yet.")
+                        sheet_label = f"{target_sheet} " if target_sheet else ""
+                        _flash("error", f"No job applications found in the {sheet_label}sheet yet.")
                         st.session_state["parsing_email"] = False
                         st.rerun()
                 except Exception as e:
@@ -1328,18 +1366,13 @@ def main():
                     st.session_state["parsing_email"] = False
                     st.rerun()
 
-            st.session_state["llm_providers_used"] = []  # reset before this AI call
-
-            with st.spinner("Parsing email with AI..."):
-                try:
-                    result = parse_email(email_body, jobs)
-                    st.session_state["email_parsed"] = result
-                    st.session_state["email_jobs"] = jobs
-                    st.session_state["email_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
-                except Exception as e:
-                    _flash("error", f"Parsing failed: {e}")
-                    st.session_state["parsing_email"] = False
-                    st.rerun()
+            result["matched_row"], result["matched_row_candidates"] = fuzzy_find_job(
+                result.get("matched_company", ""), result.get("matched_role", ""), jobs,
+                email_date=result.get("email_date", ""),
+            )
+            st.session_state["email_parsed"] = result
+            st.session_state["email_jobs"] = jobs
+            st.session_state["email_target_sheet"] = target_sheet
 
             st.session_state["parsing_email"] = False
             st.rerun()
@@ -1347,14 +1380,17 @@ def main():
         if "email_parsed" in st.session_state:
             r = st.session_state["email_parsed"]
             jobs = st.session_state.get("email_jobs", [])
+            target_sheet = st.session_state.get("email_target_sheet")
 
             st.divider()
             st.subheader("Review & Apply Update")
+            if target_sheet:
+                st.caption(f"📁 This email is dated {ARCHIVE_SHEET_YEAR} — matching against the **{target_sheet}** sheet tab.")
             if st.session_state.get("email_used_fallback"):
                 st.caption("⚙️ OpenRouter was unavailable for this request — used Groq fallback.")
 
-            # matched_row was already resolved deterministically in parse_email() via
-            # fuzzy_find_job (company AND role text match against the full job history)
+            # matched_row was already resolved deterministically above via fuzzy_find_job
+            # (company AND role text match against the target sheet's full job history)
             # — no AI row-number guessing involved.
             matched_row = r.get("matched_row")
             ambiguous_rows = r.get("matched_row_candidates") or []
@@ -1463,6 +1499,7 @@ def main():
                         st.session_state["success_msg"] = "Already added that one — skipped a duplicate submission."
                         st.session_state.pop("email_parsed", None)
                         st.session_state.pop("email_jobs", None)
+                        st.session_state.pop("email_target_sheet", None)
                         st.session_state["email_key"] += 1
                         st.session_state["adding_from_email"] = False
                         st.rerun()
@@ -1476,11 +1513,13 @@ def main():
                                 "cv_lang": st.session_state.get("cv_lang", "EN"), "source": "Other",
                                 "match_level": "", "missing_skills": "",
                                 "date_applied": new_date.strip(),
-                            })
+                            }, sheet_name=target_sheet)
                             _mark_submitted(sig)
-                            st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
+                            sheet_note = f" ({target_sheet} sheet)" if target_sheet else ""
+                            st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet{sheet_note}!"
                             st.session_state.pop("email_parsed", None)
                             st.session_state.pop("email_jobs", None)
+                            st.session_state.pop("email_target_sheet", None)
                             st.session_state["email_key"] += 1
                             st.session_state["adding_from_email"] = False
                             st.rerun()
@@ -1531,13 +1570,18 @@ def main():
                 if st.session_state.get("updating_sheet"):
                     with st.spinner("Updating sheet..."):
                         try:
-                            ok = update_job_from_email(selected_row_no, new_status, company_comments, email_date)
+                            ok = update_job_from_email(
+                                selected_row_no, new_status, company_comments, email_date,
+                                sheet_name=target_sheet,
+                            )
                             if ok:
+                                sheet_note = f" ({target_sheet} sheet)" if target_sheet else ""
                                 st.session_state["success_msg"] = (
-                                    f"✅ Row #{selected_row_no} updated — Status: {new_status}"
+                                    f"✅ Row #{selected_row_no} updated{sheet_note} — Status: {new_status}"
                                 )
                                 st.session_state.pop("email_parsed", None)
                                 st.session_state.pop("email_jobs", None)
+                                st.session_state.pop("email_target_sheet", None)
                                 st.session_state["email_key"] += 1  # clears email text area
                                 st.session_state["updating_sheet"] = False
                                 st.rerun()
