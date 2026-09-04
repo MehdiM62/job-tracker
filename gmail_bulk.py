@@ -736,11 +736,39 @@ def group_results(results: list) -> list:
 
 # ── Apply (the only writes in this module) ───────────────────────────────────
 
-def _apply_matched(group: dict, row_no: int, target_sheet, overrides: dict) -> dict:
+def _apply_with_retry(fn, *args, max_attempts=4, **kwargs):
+    """Retries a Sheets-API write with exponential backoff (1s, 2s, 4s) when Google
+    returns a rate-limit/transient error (429/500/503) — applying a large batch of
+    consolidated groups after a big historical scan means many sequential writes
+    (status, comments, backfills, formatting, import-log row — several gspread calls
+    PER email), which can exceed Sheets' default ~60-writes/minute quota well before
+    the batch finishes. Without this, one 429 mid-batch used to raise all the way up
+    through apply_group() and crash the whole page (a real incident, not hypothetical —
+    reported with a traceback landing exactly here)."""
+    delay = 1.0
+    for attempt in range(max_attempts):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in (429, 500, 503) or attempt == max_attempts - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
+def _apply_matched(group: dict, row_no: int, target_sheet, overrides: dict, already_applied_ids: set | None = None) -> dict:
     applied = 0
     items = group["items"]
     comment_overrides = overrides.get("comments") or {}
     for idx, item in enumerate(items):
+        if already_applied_ids and item["message_id"] in already_applied_ids:
+            # This exact email was already successfully written and logged in a PRIOR
+            # apply attempt (e.g. one that crashed partway through a large batch) —
+            # re-running it would append a second, duplicate dated Company Comments
+            # entry for the same email. Skip it; it's already reflected in the sheet.
+            applied += 1
+            continue
         info = dict(item["info"])
         if idx == len(items) - 1:
             if overrides.get("status"):
@@ -752,25 +780,38 @@ def _apply_matched(group: dict, row_no: int, target_sheet, overrides: dict) -> d
         comment_text = comment_overrides.get(item["message_id"], info.get("company_comments", ""))
         info["company_comments"] = comment_text
         try:
-            ok, _filled = app.update_job_from_email(
-                row_no, info.get("new_status", ""), comment_text,
+            ok, _filled = _apply_with_retry(
+                app.update_job_from_email, row_no, info.get("new_status", ""), comment_text,
                 info.get("email_date", ""), sheet_name=target_sheet, email_info=info,
             )
         except Exception as e:
             return {"ok": False, "error": str(e), "applied": applied}
         if not ok:
             return {"ok": False, "error": f"Row #{row_no} not found in the sheet.", "applied": applied}
-        log_processed_email(
-            item["message_id"], item["thread_id"], info.get("email_date", ""),
-            info.get("matched_company", ""), info.get("matched_role", ""),
-            target_sheet or _default_sheet_title(), row_no, f"updated status={info.get('new_status', '')}",
-        )
+        try:
+            _apply_with_retry(
+                log_processed_email, item["message_id"], item["thread_id"], info.get("email_date", ""),
+                info.get("matched_company", ""), info.get("matched_role", ""),
+                target_sheet or _default_sheet_title(), row_no, f"updated status={info.get('new_status', '')}",
+            )
+        except Exception:
+            # The actual sheet update above already succeeded — that's what matters.
+            # A missing import-log row just means a future scan might re-analyze this
+            # one message (wasted LLM cost, not data loss) — far better than treating a
+            # successful write as a failure, or letting this crash the whole batch.
+            pass
         applied += 1
     return {"ok": True, "error": None, "applied": applied}
 
 
-def _apply_new(group: dict, target_sheet, overrides: dict) -> dict:
+def _apply_new(group: dict, target_sheet, overrides: dict, already_applied_ids: set | None = None) -> dict:
     items = group["items"]
+    if already_applied_ids and any(i["message_id"] in already_applied_ids for i in items):
+        # A NEW-application group is a single append_job() call for the whole group —
+        # unlike a matched group, there's no safe per-item granularity here. If any of
+        # its emails is already logged, the row was already created in a prior attempt;
+        # re-running would create a genuine DUPLICATE application row. Treat as done.
+        return {"ok": True, "error": None, "applied": len(items), "already_applied": True}
     earliest = items[0]
     comment_overrides = overrides.get("comments") or {}
     seen_lines: set = set()
@@ -805,24 +846,29 @@ def _apply_new(group: dict, target_sheet, overrides: dict) -> dict:
         "date_applied": date_applied,
     }
     try:
-        row_no = app.append_job(data, sheet_name=target_sheet)
+        row_no = _apply_with_retry(app.append_job, data, sheet_name=target_sheet)
     except Exception as e:
         return {"ok": False, "error": str(e), "applied": 0}
     for item in items:
-        log_processed_email(
-            item["message_id"], item["thread_id"], item["info"].get("email_date", ""),
-            data["company"], data["role"], target_sheet or _default_sheet_title(), row_no, "created",
-        )
+        try:
+            _apply_with_retry(
+                log_processed_email, item["message_id"], item["thread_id"], item["info"].get("email_date", ""),
+                data["company"], data["role"], target_sheet or _default_sheet_title(), row_no, "created",
+            )
+        except Exception:
+            # The row itself was already created above — see the matching comment in
+            # _apply_matched for why a logging failure doesn't fail the whole group.
+            pass
     return {"ok": True, "error": None, "applied": len(items)}
 
 
-def apply_group(group: dict, overrides: dict | None = None) -> dict:
+def apply_group(group: dict, overrides: dict | None = None, already_applied_ids: set | None = None) -> dict:
     overrides = overrides or {}
     row_no = overrides.get("row_no") or group["matched_row"]
     if row_no and not overrides.get("force_new"):
-        return _apply_matched(group, row_no, group["target_sheet"], overrides)
+        return _apply_matched(group, row_no, group["target_sheet"], overrides, already_applied_ids)
     if group["kind"] == "new" or overrides.get("force_new"):
-        return _apply_new(group, group["target_sheet"], overrides)
+        return _apply_new(group, group["target_sheet"], overrides, already_applied_ids)
     return {"ok": False, "error": "No target row selected — pick a match or skip.", "applied": 0}
 
 
@@ -1239,15 +1285,35 @@ def _render_apply_controls() -> None:
     if not st.session_state.get("bulk_applying"):
         return
 
-    with st.spinner(f"Applying {len(approved)} approved update(s)..."):
-        results = [(g, apply_group(g, decisions[g["group_key"]])) for g in approved]
+    # A previous attempt may have crashed partway through a large batch (a real
+    # incident: a Sheets-API rate-limit error mid-apply used to raise all the way up
+    # and take down the whole page). Whatever it already successfully logged is the
+    # ground truth for "already applied" — apply_group() uses this to skip re-applying
+    # those specific emails instead of writing duplicate comments/rows for them.
+    try:
+        already_applied_ids = load_processed_ids()
+    except Exception:
+        already_applied_ids = None  # can't check — proceed without the safety net rather than blocking Apply entirely
 
-    ok_count = sum(1 for _, r in results if r["ok"])
-    fail_count = len(results) - ok_count
-    for g, r in results:
+    status_ph = st.empty()
+    results = []
+    for idx, g in enumerate(approved, start=1):
+        status_ph.markdown(f"Applying {idx} / {len(approved)}...")
+        try:
+            r = apply_group(g, decisions[g["group_key"]], already_applied_ids=already_applied_ids)
+        except Exception as e:
+            # Defense in depth: no single group's failure — expected (a row no longer
+            # exists) or not — should ever crash the whole batch and lose every OTHER
+            # group's already-recorded outcome below.
+            r = {"ok": False, "error": str(e), "applied": 0}
         decisions[g["group_key"]]["action"] = "applied" if r["ok"] else "failed"
         if not r["ok"]:
             decisions[g["group_key"]]["error"] = r["error"]
+        results.append((g, r))
+    status_ph.empty()
+
+    ok_count = sum(1 for _, r in results if r["ok"])
+    fail_count = len(results) - ok_count
 
     st.session_state["bulk_groups"] = [
         g for g in groups if decisions.get(g["group_key"], {}).get("action") != "applied"

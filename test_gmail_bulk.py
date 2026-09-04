@@ -335,6 +335,55 @@ def test_apply_only_touches_approved_group():
     check("group B's message id is never logged (untouched)", "b1" not in logged)
 
 
+# ── Apply resilience: a Sheets-API rate-limit/transient error mid-batch used to crash
+# the whole page (real incident). Verify a logging failure doesn't invalidate an
+# already-successful sheet write, and that retrying a partially-applied batch skips
+# whatever was already logged instead of writing duplicates. ──
+def test_log_failure_does_not_fail_group():
+    updates = []
+    appmod.update_job_from_email = lambda row_no, status, comments, email_date, sheet_name=None, email_info=None: (updates.append((row_no, status)), (True, []))[1]
+
+    def failing_log(msg_id, *a, **k):
+        raise RuntimeError("simulated Sheets API error")
+
+    gb.log_processed_email = failing_log
+    JOBS_BY_SHEET[None] = [{
+        "No.": "40", "Company": "Nu Corp", "Role": "Eng", "Status": "Applied",
+        "Contact Person": "", "Company Comments": "", "Date Applied": "2026-01-01",
+    }]
+    items = [mk_result("l1", "s", None, 40, [], mk_info("Nu Corp", "Eng", "Interview", "2026-01-05"), ms_for(2026, 1, 5))]
+    group = gb._build_group("matched", ("row", None, 40), items)
+    result = gb.apply_group(group, {"comments": {}})
+    check("group still succeeds when only the import-log write fails", result["ok"] is True)
+    check("the actual sheet write happened despite the logging failure", updates == [(40, "Interview")])
+
+
+def test_already_applied_messages_are_skipped_on_retry():
+    updates, appends, logged = [], [], []
+    appmod.update_job_from_email = lambda row_no, status, comments, email_date, sheet_name=None, email_info=None: (updates.append((row_no, status)), (True, []))[1]
+    appmod.append_job = lambda data, sheet_name=None: (appends.append(data), 999)[1]
+    gb.log_processed_email = lambda msg_id, *a, **k: logged.append(msg_id)
+
+    JOBS_BY_SHEET[None] = [{
+        "No.": "50", "Company": "Xi Co", "Role": "PM", "Status": "Applied",
+        "Contact Person": "", "Company Comments": "", "Date Applied": "2026-01-01",
+    }]
+    items = [
+        mk_result("r1", "s", None, 50, [], mk_info("Xi Co", "PM", "Applied", "2026-01-01"), ms_for(2026, 1, 1)),
+        mk_result("r2", "s", None, 50, [], mk_info("Xi Co", "PM", "Interview", "2026-01-10"), ms_for(2026, 1, 10)),
+    ]
+    group = gb._build_group("matched", ("row", None, 50), items)
+    result = gb.apply_group(group, {"comments": {}}, already_applied_ids={"r1"})
+    check("retry skips the sheet write for an already-logged item", updates == [(50, "Interview")])
+    check("retry only re-logs the not-yet-logged item", logged == ["r2"])
+    check("the skipped item still counts toward applied", result["applied"] == 2)
+
+    new_items = [mk_result("n1", "s", None, None, [], mk_info("Omicron", "Dev", "Applied", "2026-02-01", confirmation=True), ms_for(2026, 2, 1))]
+    new_group = gb._build_group("new", ("new", None, "omicron", "dev", "n1"), new_items)
+    result2 = gb.apply_group(new_group, {"comments": {}}, already_applied_ids={"n1"})
+    check("an already-logged new-application group is skipped entirely, no duplicate row", result2.get("already_applied") is True and appends == [])
+
+
 def main():
     tests = [
         test_canonical_status_fixes_case_sensitivity,
@@ -352,6 +401,8 @@ def main():
         test_scan_period_is_read_only,
         test_group_results_is_deterministic_across_reruns,
         test_apply_only_touches_approved_group,
+        test_log_failure_does_not_fail_group,
+        test_already_applied_messages_are_skipped_on_retry,
     ]
     for t in tests:
         print(f"--- {t.__name__} ---")

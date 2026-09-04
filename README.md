@@ -385,6 +385,12 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
 - **2025 vs. current-year routing**: a scanned email dated in 2025 is matched and
   updated against the **2025** worksheet tab; anything else uses your current-year
   sheet — the same routing **Update from Email** already uses.
+- **Applying a large batch is resilient to Google's rate limits**: writing many
+  consolidated groups in one go can hit Sheets' write quota — each write that hits a
+  rate-limit/transient error is retried automatically with backoff, and if a batch is
+  ever interrupted partway through, clicking **Apply Approved Updates** again safely
+  skips whatever was already successfully applied (checked against the Email Import
+  Log) instead of writing duplicate comments or duplicate application rows.
 - **Email Import Log**: a worksheet (auto-created, visible in your sheet tabs) records
   each Gmail message only *after* its update/creation is successfully applied — never
   merely for being scanned. Re-scanning the same period skips already-applied messages,
