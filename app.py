@@ -580,10 +580,19 @@ Analyse how well the candidate fits this job and return ONLY a JSON object:
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 
-def get_worksheet(sheet_name: str | None = None):
-    """sheet_name selects a specific tab by title (e.g. the "2025" archive tab);
-    omitted/None keeps the existing default of the spreadsheet's first tab (the current
-    year's sheet), so every call site that doesn't pass it behaves exactly as before."""
+@st.cache_resource(ttl=300, show_spinner=False)
+def _open_spreadsheet():
+    """Authorizing + gc.open_by_key() each do their own Sheets-API metadata READ —
+    get_worksheet() used to redo both on every single call, with no caching at all. A
+    bulk Apply on a large batch calls it several times per email (once inside
+    update_job_from_email, again inside log_processed_email, ...), which was enough to
+    exceed Sheets' "Read requests per minute per user" quota mid-batch and crash the
+    whole page (a real incident: APIError 429 on this exact call). Caching the opened
+    Spreadsheet handle for a few minutes (st.cache_resource is process-wide, shared
+    across sessions — safe here, it's just a client handle, not per-user state) turns
+    hundreds of redundant reads into effectively one. The short TTL still picks up a
+    worksheet added outside this process (e.g. manually in Google Sheets) reasonably
+    promptly rather than caching forever."""
     try:
         info = dict(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -596,7 +605,14 @@ def get_worksheet(sheet_name: str | None = None):
             )
         creds = Credentials.from_service_account_file(path, scopes=SCOPES)
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SHEET_ID)
+    return gc.open_by_key(SHEET_ID)
+
+
+def get_worksheet(sheet_name: str | None = None):
+    """sheet_name selects a specific tab by title (e.g. the "2025" archive tab);
+    omitted/None keeps the existing default of the spreadsheet's first tab (the current
+    year's sheet), so every call site that doesn't pass it behaves exactly as before."""
+    sh = _open_spreadsheet()
     return sh.worksheet(sheet_name) if sheet_name else sh.sheet1
 
 
