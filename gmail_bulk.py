@@ -1273,9 +1273,23 @@ def _render_apply_controls() -> None:
     groups = st.session_state.get("bulk_groups", [])
     decisions = st.session_state.get("bulk_group_decisions", {})
     approved = [g for g in groups if decisions.get(g["group_key"], {}).get("action") == "approve"]
+    failed = [g for g in groups if decisions.get(g["group_key"], {}).get("action") == "failed"]
 
     st.divider()
     st.markdown(f"**{len(approved)} application(s)** marked for approval.")
+
+    if failed:
+        st.warning(f"⚠️ {len(failed)} group(s) failed on the last Apply.")
+        if st.button(f"🔁 Re-approve {len(failed)} failed group(s) for retry", key="bulk_reapprove_failed_btn"):
+            # Each decision dict still holds its original row_no/status/contact/comments
+            # from when it was first approved — only the action flips back, nothing the
+            # user chose is lost. Safe to retry: already-applied emails within a
+            # partially-failed group are skipped automatically (see already_applied_ids
+            # in apply_group below), so this never re-writes what already succeeded.
+            for g in failed:
+                decisions[g["group_key"]]["action"] = "approve"
+                decisions[g["group_key"]].pop("error", None)
+            st.rerun()
 
     applying = st.session_state.get("bulk_applying", False)
     if st.button("🚀 Apply Approved Updates", type="primary", disabled=applying or not approved, key="bulk_apply_btn"):
