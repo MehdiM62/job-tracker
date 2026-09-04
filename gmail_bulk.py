@@ -737,14 +737,20 @@ def group_results(results: list) -> list:
 # ── Apply (the only writes in this module) ───────────────────────────────────
 
 def _apply_with_retry(fn, *args, max_attempts=4, **kwargs):
-    """Retries a Sheets-API write with exponential backoff (1s, 2s, 4s) when Google
-    returns a rate-limit/transient error (429/500/503) — applying a large batch of
-    consolidated groups after a big historical scan means many sequential writes
-    (status, comments, backfills, formatting, import-log row — several gspread calls
-    PER email), which can exceed Sheets' default ~60-writes/minute quota well before
-    the batch finishes. Without this, one 429 mid-batch used to raise all the way up
-    through apply_group() and crash the whole page (a real incident, not hypothetical —
-    reported with a traceback landing exactly here)."""
+    """Retries a Sheets-API call with exponential backoff (1s, 2s, 4s) on a rate-
+    limit/transient error (429/500/503).
+
+    ONLY safe to use on an operation that's harmless to run more than once —
+    log_processed_email() (an append-only Import Log row) is the one call site left.
+    Do NOT wrap update_job_from_email() or append_job() with this: both are multi-step,
+    non-idempotent writes, and this module used to retry append_job() this way — when
+    the insert itself had already succeeded and a LATER step in that same call then hit
+    a transient error, the retry re-ran the whole function and inserted a second,
+    duplicate application row. Confirmed live: this produced real duplicate rows and a
+    corrupted No. column in the "2025" sheet. A genuine failure in either of those two
+    should surface as "failed" instead so the user re-approves and retries
+    deliberately — apply_group()'s already_applied_ids check then safely no-ops
+    whatever turns out to have already succeeded."""
     delay = 1.0
     for attempt in range(max_attempts):
         try:
@@ -780,8 +786,14 @@ def _apply_matched(group: dict, row_no: int, target_sheet, overrides: dict, alre
         comment_text = comment_overrides.get(item["message_id"], info.get("company_comments", ""))
         info["company_comments"] = comment_text
         try:
-            ok, _filled = _apply_with_retry(
-                app.update_job_from_email, row_no, info.get("new_status", ""), comment_text,
+            # NOT retried: update_job_from_email does several sequential writes
+            # (status, comments, backfills, formatting) that aren't atomic — retrying
+            # the whole call after a partial failure could append a second, duplicate
+            # dated Company Comments entry. A real failure here should surface plainly
+            # so the user can re-approve and retry deliberately, not get silently
+            # double-applied by an internal retry.
+            ok, _filled = app.update_job_from_email(
+                row_no, info.get("new_status", ""), comment_text,
                 info.get("email_date", ""), sheet_name=target_sheet, email_info=info,
             )
         except Exception as e:
@@ -846,7 +858,16 @@ def _apply_new(group: dict, target_sheet, overrides: dict, already_applied_ids: 
         "date_applied": date_applied,
     }
     try:
-        row_no = _apply_with_retry(app.append_job, data, sheet_name=target_sheet)
+        # NOT retried, deliberately: append_job() is a multi-step, non-idempotent
+        # insert (read → compute position → insert row → renumber pushed-down rows).
+        # This module used to wrap it in retry-on-429 — if the insert itself had
+        # already succeeded and a LATER step in that same call then hit a transient
+        # error, the retry re-ran the entire function and inserted a second, duplicate
+        # row. Confirmed live: this produced real duplicate application rows and a
+        # corrupted No. column. A genuine failure here should surface as "failed" so
+        # the user re-approves deliberately — apply_group()'s already_applied_ids check
+        # then safely skips it if it turns out the row really was created already.
+        row_no = app.append_job(data, sheet_name=target_sheet)
     except Exception as e:
         return {"ok": False, "error": str(e), "applied": 0}
     for item in items:

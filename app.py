@@ -835,7 +835,18 @@ def append_job(data: dict, sheet_name: str | None = None) -> int:
     else:
         ws.insert_row(row_values, sheet_row, value_input_option="USER_ENTERED", inherit_from_before=True)
         renumber_range = f"A{sheet_row + 1}:A{sheet_row + (total_existing - insert_idx)}"
-        bumped = [[str(int(r[0]) + 1)] for r in ws.get(renumber_range) if r and r[0].strip().isdigit()]
+        # Bumped values come from data_rows — the SAME read taken at the top of this
+        # call, before this insert — rather than re-reading the range after the insert.
+        # A re-read here used to be able to race a Sheets consistency lag when several
+        # append_job() calls fire back-to-back in a bulk-apply batch (confirmed live:
+        # this produced duplicate/misaligned No. values across dozens of rows). The
+        # pushed-down rows' own prior No. values are already known from that first
+        # read, so there's nothing to gain from reading them again.
+        bumped = [
+            [str(int(data_rows[i][0]) + 1)]
+            for i in range(insert_idx, total_existing)
+            if data_rows[i] and data_rows[i][0].strip().isdigit()
+        ]
         if bumped:
             ws.update(bumped, renumber_range, value_input_option="RAW")
 
