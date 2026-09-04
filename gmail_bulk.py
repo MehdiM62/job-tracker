@@ -785,6 +785,16 @@ def _render_scan_controls() -> None:
                 # (e.g. the same application matched again), showing it as already
                 # decided before this scan's results were even reviewed.
                 st.session_state["bulk_group_decisions"] = {}
+                # A group's group_key is deterministic (target_sheet + row, or company/
+                # role for a new-application group), so the SAME key recurs whenever a
+                # later scan matches the same application again. Streamlit widgets only
+                # honor index=/value= the first time a given key is created — on a
+                # repeat key they silently keep whatever the widget last held, which
+                # made the Status dropdown (and every other per-group field) show a
+                # stale leftover choice from an earlier scan instead of the freshly
+                # computed proposal. Bumping this counter gives every scan's widgets a
+                # brand-new key namespace so their defaults are always honored.
+                st.session_state["bulk_scan_id"] = st.session_state.get("bulk_scan_id", 0) + 1
         except Exception as e:
             app._flash("error", f"Gmail scan failed: {e}")
         finally:
@@ -822,6 +832,12 @@ def _render_group(g: dict) -> None:
     decisions = st.session_state.setdefault("bulk_group_decisions", {})
     gk = g["group_key"]
     decision = decisions.get(gk, {"action": "pending"})
+    # Namespaces every widget key below by the current scan generation — see the
+    # bulk_scan_id comment in _render_scan_controls for why this is needed: a group's
+    # group_key is deterministic and recurs across scans whenever the same application
+    # matches again, and Streamlit only honors index=/value= the first time a given key
+    # is created, so an un-namespaced key would silently keep a stale prior-scan value.
+    sk = st.session_state.get("bulk_scan_id", 0)
 
     sheet_label = g["target_sheet"] or _default_sheet_title()
     header = f"{g['company']} — {g['role']} · {sheet_label}"
@@ -856,7 +872,7 @@ def _render_group(g: dict) -> None:
             if g["current_company_comments"].strip():
                 st.text_area(
                     "Existing Company Comments", value=g["current_company_comments"],
-                    key=f"bulk_existing_comments_{gk}", disabled=True, height=100,
+                    key=f"bulk_existing_comments_{sk}_{gk}", disabled=True, height=100,
                     label_visibility="collapsed",
                 )
             else:
@@ -869,7 +885,7 @@ def _render_group(g: dict) -> None:
             st.caption(f"📧 {info.get('email_date', '') or '?'} — {item['subject']}")
             comment_edits[item["message_id"]] = st.text_area(
                 f"Comment for {item['message_id']}", value=info.get("company_comments", ""),
-                key=f"bulk_comment_ov_{gk}_{item['message_id']}", height=80,
+                key=f"bulk_comment_ov_{sk}_{gk}_{item['message_id']}", height=80,
                 label_visibility="collapsed",
             )
 
@@ -886,7 +902,7 @@ def _render_group(g: dict) -> None:
                 return f"Row {no} — {d['company']} | {d['role']} | {d['status']} | {d['date_applied']}"
 
             options = ["— select —"] + [_row_label(n) for n in g["ambiguous_rows"]]
-            choice = st.selectbox("Match to row", options, key=f"bulk_row_pick_{gk}")
+            choice = st.selectbox("Match to row", options, key=f"bulk_row_pick_{sk}_{gk}")
             if choice == "— select —":
                 selected_row = None
             else:
@@ -900,7 +916,7 @@ def _render_group(g: dict) -> None:
                     if picked["company_comments"].strip():
                         st.text_area(
                             "Selected row's Company Comments", value=picked["company_comments"],
-                            key=f"bulk_amb_comments_{gk}", disabled=True, height=100,
+                            key=f"bulk_amb_comments_{sk}_{gk}", disabled=True, height=100,
                             label_visibility="collapsed",
                         )
                     else:
@@ -908,7 +924,7 @@ def _render_group(g: dict) -> None:
         elif g["kind"] == "single" and g["matched_row"] is None:
             st.caption("No tracked application found for this company/role.")
             treat_as_new = st.checkbox(
-                "Treat as a new application (create a row)", key=f"bulk_treat_new_{gk}", value=False,
+                "Treat as a new application (create a row)", key=f"bulk_treat_new_{sk}_{gk}", value=False,
             )
 
         status_options = list(app.STATUSES)
@@ -927,14 +943,14 @@ def _render_group(g: dict) -> None:
                 f"defaulted to **{status_options[default_status_idx]}** below. Please verify before approving."
             )
         edited_status = st.selectbox(
-            "Status (edit if needed)", status_options, index=default_status_idx, key=f"bulk_status_ov_{gk}",
+            "Status (edit if needed)", status_options, index=default_status_idx, key=f"bulk_status_ov_{sk}_{gk}",
         )
-        edited_contact = st.text_input("Contact (edit if needed)", value=g["proposed_contact"], key=f"bulk_contact_ov_{gk}")
+        edited_contact = st.text_input("Contact (edit if needed)", value=g["proposed_contact"], key=f"bulk_contact_ov_{sk}_{gk}")
 
         can_approve = bool(selected_row) or treat_as_new
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("✅ Approve", key=f"bulk_approve_{gk}", disabled=not can_approve):
+            if st.button("✅ Approve", key=f"bulk_approve_{sk}_{gk}", disabled=not can_approve):
                 decisions[gk] = {
                     "action": "approve",
                     "row_no": selected_row if not treat_as_new else None,
@@ -945,7 +961,7 @@ def _render_group(g: dict) -> None:
                 }
                 st.rerun()
         with b2:
-            if st.button("⏭️ Skip", key=f"bulk_skip_{gk}"):
+            if st.button("⏭️ Skip", key=f"bulk_skip_{sk}_{gk}"):
                 decisions[gk] = {"action": "skip"}
                 st.rerun()
 
