@@ -639,12 +639,26 @@ def _open_spreadsheet():
     return gc.open_by_key(SHEET_ID)
 
 
+@st.cache_resource(ttl=300, show_spinner=False)
+def _resolve_worksheet(sheet_name: str | None):
+    """Caching the opened Spreadsheet handle (_open_spreadsheet, above) turned out NOT
+    to be enough on its own — confirmed live, the exact same 429 quota error recurred
+    even with that fix deployed. Root cause: gspread's Spreadsheet.sheet1/.worksheet()
+    don't reuse the handle's own already-fetched metadata; each one does its own fresh
+    fetch_sheet_metadata() call regardless of whether the Spreadsheet object itself is
+    cached or brand new. That call is what a bulk Apply was actually making several
+    times per email. Caching the RESOLVED WORKSHEET per sheet_name closes that gap —
+    this is the thing every get_worksheet() call site actually needs, and now it's
+    fetched at most once per sheet_name per TTL window instead of every single call."""
+    sh = _open_spreadsheet()
+    return sh.worksheet(sheet_name) if sheet_name else sh.sheet1
+
+
 def get_worksheet(sheet_name: str | None = None):
     """sheet_name selects a specific tab by title (e.g. the "2025" archive tab);
     omitted/None keeps the existing default of the spreadsheet's first tab (the current
     year's sheet), so every call site that doesn't pass it behaves exactly as before."""
-    sh = _open_spreadsheet()
-    return sh.worksheet(sheet_name) if sheet_name else sh.sheet1
+    return _resolve_worksheet(sheet_name)
 
 
 EXTRA_COLS = ["Company Comments", "Match Level", "Missing Skills"]
