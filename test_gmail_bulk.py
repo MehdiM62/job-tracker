@@ -260,6 +260,20 @@ def test_low_value_role_copied_from_subject_treated_as_blank():
     check("a role that's just the email's own subject copied verbatim is treated as blank", len(keep) == 0 and len(skipped) == 1)
 
 
+def test_low_value_reason_is_human_readable_for_each_rule():
+    JOBS_BY_SHEET[None] = [{
+        "No.": "70", "Company": "Reason Co", "Role": "Ops", "Status": "Rejected",
+        "Contact Person": "", "Company Comments": "", "Date Applied": "2025-05-01",
+    }]
+    r = mk_result("m1", "s", None, 70, [], mk_info("Reason Co", "Ops", "Applied", "2026-01-01"), ms_for(2026, 1, 1))
+    g = gb.group_results([r])[0]
+    check("reason names the Rejected->Applied regression", "Rejected" in gb._low_value_reason(g) and "Applied" in gb._low_value_reason(g))
+
+    blank_role = mk_result("m2", "s", None, None, [], mk_info("Reason Co 2", "", "Applied", "2026-01-01", confirmation=True), ms_for(2026, 1, 1))
+    g2 = gb.group_results([blank_role])[0]
+    check("reason names the missing role", "role" in gb._low_value_reason(g2).lower())
+
+
 # ── Case 7: ambiguous match -> stays its own review item, never silently merged ──
 def test_ambiguous_never_merged():
     JOBS_BY_SHEET[None] = []
@@ -513,6 +527,7 @@ def main():
         test_low_value_applied_to_applied_filtered_unless_contact_backfill,
         test_low_value_new_group_with_blank_role_skipped,
         test_low_value_role_copied_from_subject_treated_as_blank,
+        test_low_value_reason_is_human_readable_for_each_rule,
         test_ambiguous_never_merged,
         test_conflict_protection_kept,
         test_skip_before_llm,

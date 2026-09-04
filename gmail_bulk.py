@@ -819,6 +819,23 @@ def _partition_low_value(groups: list) -> tuple:
     return keep, skipped
 
 
+def _low_value_reason(g: dict) -> str:
+    """Mirrors _is_low_value's conditions to explain, in the review UI, WHY a given
+    group was filtered out — so a skip can be sanity-checked instead of just trusted."""
+    if g["kind"] == "matched":
+        if g["current_status"] == "Rejected" and g["proposed_status"] == "Applied":
+            return "Proposed status regresses from Rejected back to Applied"
+        if g["current_status"] == "Applied" and g["proposed_status"] == "Applied" and not g["conflict"]:
+            return "Applied → Applied with no new contact to backfill"
+    if g["kind"] == "new":
+        role = (g["role"] or "").strip()
+        if not role:
+            return "No identifiable role/position found in the email"
+        if any(role.lower() == (item["subject"] or "").strip().lower() for item in g["items"]):
+            return "Role looks like it was just copied from the email's subject line"
+    return "Filtered as low-value"
+
+
 # ── Apply (the only writes in this module) ───────────────────────────────────
 
 def _apply_with_retry(fn, *args, max_attempts=4, **kwargs):
@@ -1016,6 +1033,7 @@ def render_bulk_email_tab() -> None:
     if "bulk_scan_summary" in st.session_state:
         _render_scan_summary()
         _render_review_queue()
+        _render_low_value_section()
         _render_apply_controls()
 
 
@@ -1123,6 +1141,10 @@ def _render_scan_controls() -> None:
         elapsed = time.monotonic() - runtime["start_time"]
         providers = st.session_state.get("llm_providers_used", [])
         st.session_state["bulk_groups"] = groups
+        # Kept separately (not silently discarded) so they can be reviewed on demand —
+        # see _render_low_value_section — in case the filter itself ever hides a
+        # genuine bug rather than real noise.
+        st.session_state["bulk_low_value_groups"] = low_value_skipped
         st.session_state["bulk_scan_summary"] = {
             "scanned": total, "cancelled": cancelled, "processed_before_stop": processed,
             "skipped": runtime["counts"]["already_processed_skipped"],
@@ -1215,6 +1237,29 @@ def _render_review_queue() -> None:
             continue
         st.subheader(f"{title} ({len(bucket_groups)})")
         for g in bucket_groups:
+            _render_group(g)
+
+
+def _render_low_value_section() -> None:
+    """Groups filtered out by _is_low_value aren't shown in the main queue (they're
+    usually genuine noise — see the docstring there), but they're not thrown away
+    either: collapsed here so a skip can be audited on demand instead of trusted
+    blindly, and — same as any other group — still Approve-able if one of them turns
+    out to actually matter. apply_group() itself doesn't distinguish where a group
+    came from, so approving one here works exactly like approving any other group."""
+    low_value = st.session_state.get("bulk_low_value_groups", [])
+    if not low_value:
+        return
+    with st.expander(f"🙈 {len(low_value)} skipped as low-value — click to review"):
+        st.caption(
+            "These weren't shown above because they matched a low-value rule (a "
+            "Rejected→Applied regression, a no-op Applied→Applied update, or a new "
+            "application with no identifiable role). Nothing here has been written "
+            "anywhere. Review them if you want to double-check the filter itself, or "
+            "approve one below if it's actually worth applying."
+        )
+        for g in low_value:
+            st.caption(f"Why skipped: {_low_value_reason(g)}")
             _render_group(g)
 
 
@@ -1379,7 +1424,10 @@ def _render_group(g: dict) -> None:
 
 
 def _render_apply_controls() -> None:
-    groups = st.session_state.get("bulk_groups", [])
+    # Includes bulk_low_value_groups too — a group filtered as low-value is still
+    # fully Approve-able from its own section (see _render_low_value_section), and
+    # apply_group() doesn't care where a group came from, so it must be reachable here.
+    groups = st.session_state.get("bulk_groups", []) + st.session_state.get("bulk_low_value_groups", [])
     decisions = st.session_state.get("bulk_group_decisions", {})
     approved = [g for g in groups if decisions.get(g["group_key"], {}).get("action") == "approve"]
     failed = [g for g in groups if decisions.get(g["group_key"], {}).get("action") == "failed"]
@@ -1438,8 +1486,14 @@ def _render_apply_controls() -> None:
     ok_count = sum(1 for _, r in results if r["ok"])
     fail_count = len(results) - ok_count
 
+    # Filtered separately (not from the combined `groups` above) so an applied
+    # low-value group is dropped from bulk_low_value_groups, not merged back into the
+    # main bulk_groups list.
     st.session_state["bulk_groups"] = [
-        g for g in groups if decisions.get(g["group_key"], {}).get("action") != "applied"
+        g for g in st.session_state.get("bulk_groups", []) if decisions.get(g["group_key"], {}).get("action") != "applied"
+    ]
+    st.session_state["bulk_low_value_groups"] = [
+        g for g in st.session_state.get("bulk_low_value_groups", []) if decisions.get(g["group_key"], {}).get("action") != "applied"
     ]
     app._flash(
         "success" if fail_count == 0 else "warning",
