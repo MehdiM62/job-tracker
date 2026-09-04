@@ -791,7 +791,10 @@ def _is_low_value(g: dict) -> bool:
       UNLESS it would backfill a currently-blank contact — otherwise it's just another
       confirmation/ack email for an application already correctly tracked.
     - A brand-new application with no identifiable role isn't worth a bare row with
-      nothing to search or filter on.
+      nothing to search or filter on. This also catches a role that's just the email's
+      own generic subject line copied verbatim (e.g. "Deine Bewerbung bei comdesk") —
+      the extraction prompt now asks the AI to leave matched_role empty in that case,
+      but this is a cheap deterministic backstop in case it still doesn't.
     """
     if g["kind"] == "matched":
         if g["current_status"] == "Rejected" and g["proposed_status"] == "Applied":
@@ -800,8 +803,12 @@ def _is_low_value(g: dict) -> bool:
             contact_backfill = app._is_blank_field(g["current_contact"]) and not app._is_blank_field(g["proposed_contact"])
             if not contact_backfill:
                 return True
-    if g["kind"] == "new" and not (g["role"] or "").strip():
-        return True
+    if g["kind"] == "new":
+        role = (g["role"] or "").strip()
+        if not role:
+            return True
+        if any(role.lower() == (item["subject"] or "").strip().lower() for item in g["items"]):
+            return True
     return False
 
 

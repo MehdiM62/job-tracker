@@ -300,7 +300,11 @@ often only identify their company through the domain, not the visible text.
 
 The email's own subject line is very often where the FULL, exact role title lives
 (the body frequently just says "your application" with no title at all) — read it
-from there whenever the body doesn't spell it out more completely.
+from there whenever the body doesn't spell it out more completely. But a generic
+subject that names no actual position (e.g. "Deine Bewerbung bei comdesk", "Your
+application", "Thank you for your interest") is NOT a role title — if neither the
+subject nor the body actually names a specific position anywhere, leave matched_role
+as an empty string rather than copying that generic subject/body text into it.
 
 Email:
 {email_text}
@@ -308,7 +312,7 @@ Email:
 Return ONLY a JSON object with these fields:
 {{
   "matched_company": "<company name from the email>",
-  "matched_role": "<the role/job title, copied in FULL exactly as written (subject line or body, whichever is more complete) — do not shorten it or drop a trailing qualifier (e.g. \\"- (Logistics - Customer, Time & Tracking)\\", \\"- AI & Service Strategy\\"). The same company can have several similar-sounding open roles that differ ONLY by that trailing detail, so dropping it makes the title match a different role than the one this email is actually about>",
+  "matched_role": "<the role/job title, copied in FULL exactly as written (subject line or body, whichever is more complete) — do not shorten it or drop a trailing qualifier (e.g. \\"- (Logistics - Customer, Time & Tracking)\\", \\"- AI & Service Strategy\\"). The same company can have several similar-sounding open roles that differ ONLY by that trailing detail, so dropping it makes the title match a different role than the one this email is actually about. Empty string if no actual position is named anywhere in the email — do not invent one from a generic subject line like \\"Your application\\">",
   "contact_person": "<recruiter/HR name, phone, email from the signature — otherwise 'Not specified'>",
   "email_date": "<date the email was sent/received, YYYY-MM-DD format — read it from the email's own date/header/signature, not today's date>",
   "email_datetime": "<the email's own date AND time, YYYY-MM-DD HH:MM format (24h) — used only if this becomes a brand-new sheet row>",
@@ -331,17 +335,36 @@ def _canonical_status(value) -> str:
     return v
 
 
+def _is_degenerate_text(text: str) -> bool:
+    """True for a degenerate-repetition output — a run of bare "…"/"..." tokens with
+    little or no real word content (e.g. "Rejection : We … … … … … … … … … … … …")
+    — a distinct provider-level failure mode from the company/status garbling
+    _looks_garbled already checked for, observed live in production on emails with a
+    lot of boilerplate/legal text (long GDPR footers, board-member lists) that seem to
+    push some models into a repetition loop. A normal bullet-formatted comment (a
+    couple of "•" markers among many real words) sits well under this threshold; a
+    genuinely degenerate response is dominated by punctuation-only tokens."""
+    words = text.split()
+    if len(words) < 6:
+        return False
+    non_alnum = sum(1 for w in words if not any(ch.isalnum() for ch in w))
+    return non_alnum / len(words) > 0.4
+
+
 def _looks_garbled(result: dict) -> bool:
     """Cheap sanity check for a technically-valid-JSON but semantically broken response —
     an occasional provider-level generation artifact observed in testing (e.g.
     matched_company coming back as "Morgan ? " instead of the full name, new_status
-    missing entirely). Not exhaustive, just catches the obvious cases so one retry can
-    recover instead of silently feeding garbage into matching / the sheet."""
+    missing entirely, or company_comments degenerating into repeated "…" — see
+    _is_degenerate_text). Not exhaustive, just catches the obvious cases so one retry
+    can recover instead of silently feeding garbage into matching / the sheet."""
     company = result.get("matched_company") or ""
     role = result.get("matched_role") or ""
     if "?" in company or "?" in role:
         return True
-    return result.get("new_status") not in STATUSES
+    if result.get("new_status") not in STATUSES:
+        return True
+    return _is_degenerate_text(result.get("company_comments") or "")
 
 
 def extract_email_info(email_text: str) -> dict:

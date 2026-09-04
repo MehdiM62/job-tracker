@@ -83,6 +83,32 @@ def test_canonical_status_fixes_case_sensitivity():
     )
 
 
+# ── Degenerate-repetition detection: a live production example where the LLM's
+# comment text degenerated into a run of bare "…" tokens (status/comment both wrong)
+# slipped past the old _looks_garbled check entirely — "Rejected" is a valid status and
+# neither company nor role contained "?", so nothing caught it. ──
+def test_degenerate_comment_text_triggers_garbled_retry():
+    check(
+        "a comment dominated by repeated ellipsis tokens is detected as degenerate",
+        appmod._is_degenerate_text("Rejection : We … … … … … … … … … … … … … …"),
+    )
+    check(
+        "a second real production example (mixed dot-runs) is also detected",
+        appmod._is_degenerate_text("Acknowledgment receipt … …… … …………………………"),
+    )
+    check(
+        "a normal short bullet comment is NOT flagged",
+        not appmod._is_degenerate_text("• Interview invite: 2026-08-14 10:00 via Teams\n• Next round: technical interview"),
+    )
+    check(
+        "a technically-valid status with degenerate comment text is still caught by _looks_garbled",
+        appmod._looks_garbled({
+            "matched_company": "CompuSafe Data Systems AG", "matched_role": "Not specified", "new_status": "Rejected",
+            "company_comments": "Rejection : We … … … … … … … … … … … … … …",
+        }),
+    )
+
+
 # ── Case 1: single email -> one group, Applied ──────────────────────────────
 def test_single_email_one_group():
     JOBS_BY_SHEET[None] = []
@@ -221,6 +247,17 @@ def test_low_value_new_group_with_blank_role_skipped():
     real_role = mk_result("m2", "s", None, None, [], mk_info("Mu Corp", "Data Analyst", "Applied", "2026-01-01", confirmation=True), ms_for(2026, 1, 1))
     keep2, skipped2 = gb._partition_low_value(gb.group_results([real_role]))
     check("a new application with a real role is kept", len(keep2) == 1 and len(skipped2) == 0)
+
+
+def test_low_value_role_copied_from_subject_treated_as_blank():
+    # Live production example: comdesk's email named no actual position anywhere, so
+    # the AI copied the generic subject line itself into matched_role — this backstop
+    # catches that even if the prompt fix doesn't (belt and suspenders).
+    JOBS_BY_SHEET[None] = []
+    subject = "Deine Bewerbung bei comdesk"
+    copied = mk_result("m1", subject, None, None, [], mk_info("comdesk", subject, "Applied", "2025-12-31", confirmation=True), ms_for(2025, 12, 31))
+    keep, skipped = gb._partition_low_value(gb.group_results([copied]))
+    check("a role that's just the email's own subject copied verbatim is treated as blank", len(keep) == 0 and len(skipped) == 1)
 
 
 # ── Case 7: ambiguous match -> stays its own review item, never silently merged ──
@@ -463,6 +500,7 @@ def test_already_applied_messages_are_skipped_on_retry():
 def main():
     tests = [
         test_canonical_status_fixes_case_sensitivity,
+        test_degenerate_comment_text_triggers_garbled_retry,
         test_single_email_one_group,
         test_matched_row_timeline_and_role_wording,
         test_same_company_different_roles_stay_separate,
@@ -474,6 +512,7 @@ def main():
         test_low_value_rejected_to_applied_skipped,
         test_low_value_applied_to_applied_filtered_unless_contact_backfill,
         test_low_value_new_group_with_blank_role_skipped,
+        test_low_value_role_copied_from_subject_treated_as_blank,
         test_ambiguous_never_merged,
         test_conflict_protection_kept,
         test_skip_before_llm,

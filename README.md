@@ -419,6 +419,10 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   brand-new application with no identifiable role are all skipped rather than shown —
   none of them are written anywhere, and a later re-scan surfaces them the same way,
   so nothing is lost, just decluttered.
+- **Garbled AI responses are detected and retried**: occasionally a provider returns a
+  broken response — an invalid status, or a comment that degenerates into repeated "…"
+  filler instead of real text — and the extraction is retried once automatically rather
+  than proposing nonsense for you to review.
 - **Final proposed status is whichever event is chronologically latest** in a group's
   timeline — not a fixed hierarchy (e.g. Applied → Interview → Rejected proposes
   Rejected; Applied → Interview → Assessment proposes Assessment). The existing
