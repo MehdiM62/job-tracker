@@ -393,7 +393,10 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   processed so far, running counts (parsed / skipped / failed), the current message's
   date/company/role/subject (never the email body), elapsed time, and — once enough
   messages have been processed — an approximate ETA. A large historical scan can still
-  take a long time; you can now see it moving.
+  take a long time; you can now see it moving. A **🛑 Cancel scan** button is always
+  available while a scan is running — the scan processes one message per screen update,
+  so cancelling takes effect almost immediately rather than only after the whole range
+  finishes. Whatever was already processed is still shown as review results.
 - **Emails are consolidated into one application timeline**: multiple emails for the
   same tracked row are always one group, regardless of wording. Untracked emails are
   grouped by company+role only when a "thank you for applying"-style confirmation email

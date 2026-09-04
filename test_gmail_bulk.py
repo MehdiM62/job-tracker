@@ -231,6 +231,59 @@ def test_extraction_failure_continues_scan():
     check("progress callback fires for the start event plus every message", len(progress_events) == 4)
 
 
+# ── Cancel support: chunked one-message-per-tick processing (what the UI now does,
+# one Streamlit rerun per message, so a Cancel click lands within ~one message's
+# latency) must produce identical results to the whole-range scan_period() call ──
+def test_chunked_scan_step_matches_whole_range_scan():
+    JOBS_BY_SHEET[None] = []
+
+    def fake_fetch(service, msg_id):
+        return {
+            "id": msg_id, "thread_id": "t1", "from": "Recruiter <r@company.com>", "to": "",
+            "subject": f"Subj {msg_id}", "date_header": "Mon, 1 Jan 2026 10:00:00 +0000",
+            "internal_date_ms": ms_for(2026, 1, 1), "body": "body",
+        }
+
+    appmod.extract_email_info = lambda text: mk_info("Kappa2", "Eng", "Applied", "2026-01-01", confirmation=True)
+    gb.build_gmail_service = lambda creds: object()
+    gb.get_own_email_address = lambda service: ""
+    gb.load_processed_ids = lambda: set()
+    ids = ["c1", "c2", "c3"]
+    gb.list_message_ids = lambda service, query: list(ids)
+    gb.fetch_message = fake_fetch
+
+    whole = gb.scan_period(object(), "Jobsearch", date(2026, 1, 1), date(2026, 2, 1))
+
+    # Replay the same ids one _scan_step call at a time — exactly what the chunked UI
+    # loop does across separate reruns via st.session_state["bulk_scan_runtime"].
+    ctx = {
+        "service": object(), "processed_ids": set(), "own_email": "",
+        "jobs_cache": {}, "results": [], "failures": [], "ai_calls_attempted": 0,
+        "counts": {"parsed_ok": 0, "own_skipped": 0, "already_processed_skipped": 0, "failed": 0},
+    }
+    for msg_id in ids:
+        gb._scan_step(ctx, msg_id)
+
+    check("chunked scan produces the same result count as scan_period", len(ctx["results"]) == len(whole["results"]) == 3)
+    check(
+        "chunked scan produces the same message ids, in order, as scan_period",
+        [r["message_id"] for r in ctx["results"]] == [r["message_id"] for r in whole["results"]],
+    )
+    check("chunked scan's parsed_ok count matches scan_period's ai_calls_attempted", ctx["counts"]["parsed_ok"] == whole["ai_calls_attempted"] == 3)
+
+
+def test_cancel_partial_results_are_still_valid_groups():
+    # A cancelled scan finalizes with whatever's in runtime["results"] so far — confirm
+    # group_results() handles a partial (stopped mid-way) list exactly like a complete
+    # one, i.e. cancelling doesn't corrupt or special-case the grouping logic at all.
+    JOBS_BY_SHEET[None] = []
+    partial_results = [
+        mk_result("p1", "s", None, None, [], mk_info("Lambda", "Eng", "Applied", "2026-01-01", confirmation=True), ms_for(2026, 1, 1)),
+    ]
+    groups = gb.group_results(partial_results)
+    check("partial (cancelled-scan) results still group normally", len(groups) == 1 and groups[0]["email_count"] == 1)
+
+
 # ── Case 13 (structural): scan_period never writes ──────────────────────────
 def test_scan_period_is_read_only():
     # Require call syntax ("(") so this doesn't false-positive on scan_period's own
@@ -294,6 +347,8 @@ def main():
         test_conflict_protection_kept,
         test_skip_before_llm,
         test_extraction_failure_continues_scan,
+        test_chunked_scan_step_matches_whole_range_scan,
+        test_cancel_partial_results_are_still_valid_groups,
         test_scan_period_is_read_only,
         test_group_results_is_deterministic_across_reruns,
         test_apply_only_touches_approved_group,

@@ -405,10 +405,93 @@ def build_email_text(msg: dict) -> str:
 
 # ── Scan (read-only) ─────────────────────────────────────────────────────────
 
+def _scan_step(ctx: dict, msg_id: str) -> dict | None:
+    """Processes exactly one Gmail message id, mutating ctx's "results"/"failures"/
+    "counts"/"jobs_cache"/"ai_calls_attempted" in place. ctx must provide "service",
+    "processed_ids" (set), "own_email" — everything scan_period() used to compute once
+    up front. Returns a small "current" dict for progress display (date/company/role/
+    subject only, never the body) or None when there's nothing worth showing (a skip).
+
+    Factored out of scan_period() so the interactive scan (see _render_scan_controls,
+    which drives this one message at a time, one Streamlit rerun per message) and the
+    plain whole-range scan_period() below share the exact same per-message logic —
+    the UI needs to process one message per rerun (not one big blocking call) so a
+    Cancel click, which Streamlit can only act on between reruns, takes effect within
+    roughly one message's latency instead of only after the entire scan finishes."""
+    service = ctx["service"]
+    processed_ids = ctx["processed_ids"]
+    own_email = ctx["own_email"]
+    results, failures, counts = ctx["results"], ctx["failures"], ctx["counts"]
+
+    if msg_id in processed_ids:
+        counts["already_processed_skipped"] += 1
+        return None
+
+    subject_for_error = ""
+    try:
+        msg = fetch_message(service, msg_id)
+        subject_for_error = msg.get("subject", "")
+    except Exception as e:
+        failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e), "stage": "fetch"})
+        counts["failed"] += 1
+        return None
+
+    # Deterministic, no LLM cost: our own replies inside a labeled recruiter thread
+    # (e.g. "thanks for the update") aren't job-status signals worth extracting.
+    if own_email and _parse_email_address(msg["from"]) == own_email:
+        counts["own_skipped"] += 1
+        return {"date": msg.get("date_header", ""), "company": "", "role": "", "subject": msg.get("subject", "")}
+
+    try:
+        email_text = build_email_text(msg)
+        ctx["ai_calls_attempted"] += 1
+        info = app.extract_email_info(email_text)
+    except Exception as e:
+        failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e), "stage": "extract"})
+        counts["failed"] += 1
+        return {"date": "", "company": "", "role": "", "subject": subject_for_error}
+
+    target_sheet = app._archive_sheet_for_email_date(info.get("email_date", ""))
+    cache_key = target_sheet or "__default__"
+    jobs_cache = ctx["jobs_cache"]
+    if cache_key not in jobs_cache:
+        try:
+            jobs_cache[cache_key] = app.get_all_jobs(app.get_worksheet(target_sheet))
+        except Exception as e:
+            failures.append({"id": msg_id, "subject": subject_for_error, "error": f"Could not load sheet: {e}", "stage": "sheet"})
+            counts["failed"] += 1
+            return None
+    jobs = jobs_cache[cache_key]
+
+    matched_row, ambiguous_rows = app.fuzzy_find_job(
+        info.get("matched_company", ""), info.get("matched_role", ""), jobs,
+        email_date=info.get("email_date", ""),
+    )
+
+    results.append({
+        "message_id": msg["id"],
+        "thread_id": msg["thread_id"],
+        "subject": msg["subject"],
+        "internal_date_ms": msg["internal_date_ms"],
+        "target_sheet": target_sheet,
+        "matched_row": matched_row,
+        "ambiguous_rows": ambiguous_rows,
+        "info": info,
+    })
+    counts["parsed_ok"] += 1
+    return {
+        "date": info.get("email_date", ""), "company": info.get("matched_company", ""),
+        "role": info.get("matched_role", ""), "subject": msg.get("subject", ""),
+    }
+
+
 def scan_period(creds, label: str, start: date, end: date, progress_cb=None) -> dict:
-    """Pure read: lists + fetches Gmail messages, extracts + matches each one via the
-    reused app.py functions. NEVER calls update_job_from_email/append_job. One bad
-    email is caught and recorded, never aborts the batch.
+    """Pure read, whole range in one call: lists + fetches Gmail messages, extracts +
+    matches each one via the reused app.py functions (see _scan_step). NEVER calls
+    update_job_from_email/append_job. One bad email is caught and recorded, never
+    aborts the batch. Not used by the interactive UI (which processes one message per
+    rerun instead, for cancellability — see _render_scan_controls) but kept as a plain
+    whole-range entry point for tests and any non-interactive use.
 
     progress_cb, if given, is called synchronously (no threads/concurrency — sequential
     processing stays as-is, only visibility is added) at every point the loop advances,
@@ -419,99 +502,26 @@ def scan_period(creds, label: str, start: date, end: date, progress_cb=None) -> 
     "subject"} only — never the email body, tokens, or raw exception text."""
     service = build_gmail_service(creds)
     query = build_query(label, start, end)
-    processed_ids = load_processed_ids()
-    own_email = get_own_email_address(service)
-
     ids = list_message_ids(service, query)
     if progress_cb:
         progress_cb({"phase": "start", "total": len(ids)})
 
-    results, failures = [], []
-    skipped = 0
-    sent_skipped = 0
-    ai_calls_attempted = 0
-    jobs_cache: dict = {}
-
-    counts = {"parsed_ok": 0, "own_skipped": 0, "already_processed_skipped": 0, "failed": 0}
-
-    def _tick(current=None):
-        if progress_cb:
-            progress_cb({
-                "phase": "progress", "total": len(ids), "processed": processed,
-                "current": current, **counts,
-            })
+    ctx = {
+        "service": service, "processed_ids": load_processed_ids(), "own_email": get_own_email_address(service),
+        "jobs_cache": {}, "results": [], "failures": [], "ai_calls_attempted": 0,
+        "counts": {"parsed_ok": 0, "own_skipped": 0, "already_processed_skipped": 0, "failed": 0},
+    }
 
     for processed, msg_id in enumerate(ids, start=1):
-        if msg_id in processed_ids:
-            skipped += 1
-            counts["already_processed_skipped"] += 1
-            _tick(None)
-            continue
-
-        subject_for_error = ""
-        try:
-            msg = fetch_message(service, msg_id)
-            subject_for_error = msg.get("subject", "")
-        except Exception as e:
-            failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e), "stage": "fetch"})
-            counts["failed"] += 1
-            _tick(None)
-            continue
-
-        # Deterministic, no LLM cost: our own replies inside a labeled recruiter thread
-        # (e.g. "thanks for the update") aren't job-status signals worth extracting.
-        if own_email and _parse_email_address(msg["from"]) == own_email:
-            sent_skipped += 1
-            counts["own_skipped"] += 1
-            _tick({"date": msg.get("date_header", ""), "company": "", "role": "", "subject": msg.get("subject", "")})
-            continue
-
-        try:
-            email_text = build_email_text(msg)
-            ai_calls_attempted += 1
-            info = app.extract_email_info(email_text)
-        except Exception as e:
-            failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e), "stage": "extract"})
-            counts["failed"] += 1
-            _tick({"date": "", "company": "", "role": "", "subject": subject_for_error})
-            continue
-
-        target_sheet = app._archive_sheet_for_email_date(info.get("email_date", ""))
-        cache_key = target_sheet or "__default__"
-        if cache_key not in jobs_cache:
-            try:
-                jobs_cache[cache_key] = app.get_all_jobs(app.get_worksheet(target_sheet))
-            except Exception as e:
-                failures.append({"id": msg_id, "subject": subject_for_error, "error": f"Could not load sheet: {e}", "stage": "sheet"})
-                counts["failed"] += 1
-                _tick(None)
-                continue
-        jobs = jobs_cache[cache_key]
-
-        matched_row, ambiguous_rows = app.fuzzy_find_job(
-            info.get("matched_company", ""), info.get("matched_role", ""), jobs,
-            email_date=info.get("email_date", ""),
-        )
-
-        results.append({
-            "message_id": msg["id"],
-            "thread_id": msg["thread_id"],
-            "subject": msg["subject"],
-            "internal_date_ms": msg["internal_date_ms"],
-            "target_sheet": target_sheet,
-            "matched_row": matched_row,
-            "ambiguous_rows": ambiguous_rows,
-            "info": info,
-        })
-        counts["parsed_ok"] += 1
-        _tick({
-            "date": info.get("email_date", ""), "company": info.get("matched_company", ""),
-            "role": info.get("matched_role", ""), "subject": msg.get("subject", ""),
-        })
+        current = _scan_step(ctx, msg_id)
+        if progress_cb:
+            progress_cb({"phase": "progress", "total": len(ids), "processed": processed, "current": current, **ctx["counts"]})
 
     return {
-        "results": results, "failures": failures, "skipped_processed": skipped,
-        "sent_skipped": sent_skipped, "scanned": len(ids), "ai_calls_attempted": ai_calls_attempted,
+        "results": ctx["results"], "failures": ctx["failures"],
+        "skipped_processed": ctx["counts"]["already_processed_skipped"],
+        "sent_skipped": ctx["counts"]["own_skipped"], "scanned": len(ids),
+        "ai_calls_attempted": ctx["ai_calls_attempted"],
     }
 
 
@@ -878,6 +888,7 @@ def _render_scan_controls() -> None:
     scanning = st.session_state.get("bulk_scanning", False)
     if st.button("🔍 Scan Gmail", disabled=scanning, key="bulk_scan_btn"):
         st.session_state["bulk_scanning"] = True
+        st.session_state["bulk_scan_runtime"] = None  # (re)built on the first tick below
         st.session_state["bulk_scan_period"] = period
         st.session_state["bulk_scan_custom_start"] = custom_start
         st.session_state["bulk_scan_custom_end"] = custom_end
@@ -887,100 +898,142 @@ def _render_scan_controls() -> None:
     if not st.session_state.get("bulk_scanning"):
         return
 
-    # Reset per-scan LLM counters (Part 2) so the summary below reflects only THIS
-    # scan, not whatever accumulated in a previous one.
-    st.session_state["llm_providers_used"] = []
-    st.session_state["llm_extract_retries"] = 0
-
-    start, end = _period_bounds(
-        st.session_state["bulk_scan_period"],
-        st.session_state.get("bulk_scan_custom_start"),
-        st.session_state.get("bulk_scan_custom_end"),
-    )
-    label = st.session_state["bulk_scan_label"]
-    query = build_query(label, start, end)
-    st.caption(f"Gmail query: `{query}`")
-
-    progress_bar = st.progress(0.0)
-    status_ph = st.empty()
-    start_time = time.monotonic()
-
-    def _on_progress(update: dict) -> None:
-        if update["phase"] == "start":
-            status_ph.markdown(f"Found **{update['total']}** message(s) — starting analysis...")
+    runtime = st.session_state.get("bulk_scan_runtime")
+    if runtime is None:
+        # First tick of a new scan: everything up to (not including) per-message
+        # processing — resolving creds, building the query, listing message ids. This
+        # part is comparatively fast (a handful of paginated list calls, not one
+        # fetch+LLM call per message) so it isn't itself chunked/cancellable; the long
+        # part that follows is.
+        creds = get_valid_credentials()
+        if not creds:
+            app._flash("error", "Gmail connection expired — please reconnect.")
+            st.session_state["bulk_scanning"] = False
+            st.rerun()
             return
-        total, processed = update["total"], update["processed"]
-        progress_bar.progress((processed / total) if total else 1.0)
-        pct = int(processed / total * 100) if total else 100
-        lines = [
-            f"**Processing {processed} / {total} — {pct}%**",
-            f"Parsed: {update['parsed_ok']} · Own sent skipped: {update['own_skipped']} · "
-            f"Already processed: {update['already_processed_skipped']} · Failed: {update['failed']}",
-        ]
-        current = update.get("current") or {}
+        # Reset per-scan LLM counters (Part 2) so the summary below reflects only THIS
+        # scan, not whatever accumulated in a previous one.
+        st.session_state["llm_providers_used"] = []
+        st.session_state["llm_extract_retries"] = 0
+        start, end = _period_bounds(
+            st.session_state["bulk_scan_period"],
+            st.session_state.get("bulk_scan_custom_start"),
+            st.session_state.get("bulk_scan_custom_end"),
+        )
+        label = st.session_state["bulk_scan_label"]
+        query = build_query(label, start, end)
+        try:
+            service = build_gmail_service(creds)
+            ids = list_message_ids(service, query)
+            runtime = {
+                "query": query, "ids": ids, "index": 0, "service": service,
+                "processed_ids": load_processed_ids(), "own_email": get_own_email_address(service),
+                "jobs_cache": {}, "results": [], "failures": [], "ai_calls_attempted": 0,
+                "counts": {"parsed_ok": 0, "own_skipped": 0, "already_processed_skipped": 0, "failed": 0},
+                "start_time": time.monotonic(), "current": None,
+            }
+        except Exception as e:
+            app._flash("error", f"Gmail scan failed: {e}")
+            st.session_state["bulk_scanning"] = False
+            st.rerun()
+            return
+        st.session_state["bulk_scan_runtime"] = runtime
+
+    total = len(runtime["ids"])
+    processed = runtime["index"]
+    st.caption(f"Gmail query: `{runtime['query']}`")
+
+    cancel_col, _spacer = st.columns([1, 3])
+    with cancel_col:
+        cancel_clicked = st.button("🛑 Cancel scan", key="bulk_scan_cancel_btn")
+
+    st.progress((processed / total) if total else 1.0)
+    lines = [f"**Processing {processed} / {total} — {int(processed / total * 100) if total else 100}%**"]
+    if total:
+        c = runtime["counts"]
+        lines.append(
+            f"Parsed: {c['parsed_ok']} · Own sent skipped: {c['own_skipped']} · "
+            f"Already processed: {c['already_processed_skipped']} · Failed: {c['failed']}"
+        )
+        current = runtime.get("current") or {}
         cur_bits = " — ".join(v for v in (current.get("date"), current.get("company"), current.get("role"), current.get("subject")) if v)
         if cur_bits:
             lines.append(f"Current: {cur_bits}")
-        elapsed = time.monotonic() - start_time
+        elapsed = time.monotonic() - runtime["start_time"]
         lines.append(f"Elapsed: {_format_hms(elapsed)}")
         if processed >= 10 and processed < total:
             remaining_min = max(1, round(elapsed / processed * (total - processed) / 60))
             lines.append(f"Estimated remaining: ~{remaining_min} min (approximate)")
-        status_ph.markdown("  \n".join(lines))
+    st.markdown("  \n".join(lines))
 
-    with st.spinner("Scanning Gmail — this can take a while for large date ranges..."):
-        try:
-            creds = get_valid_credentials()
-            if not creds:
-                app._flash("error", "Gmail connection expired — please reconnect.")
-            else:
-                scan = scan_period(creds, label, start, end, progress_cb=_on_progress)
-                groups = group_results(scan["results"])
-                elapsed = time.monotonic() - start_time
-                providers = st.session_state.get("llm_providers_used", [])
-                st.session_state["bulk_groups"] = groups
-                st.session_state["bulk_scan_summary"] = {
-                    "scanned": scan["scanned"],
-                    "skipped": scan["skipped_processed"],
-                    "sent_skipped": scan["sent_skipped"],
-                    "failed": len(scan["failures"]),
-                    "extraction_failures": sum(1 for f in scan["failures"] if f.get("stage") == "extract"),
-                    "ai_calls_attempted": scan["ai_calls_attempted"],
-                    "llm_retries": st.session_state.get("llm_extract_retries", 0),
-                    "openrouter_successes": providers.count("openrouter"),
-                    "groq_successes": providers.count("groq"),
-                    "groups": len(groups),
-                    "high": sum(1 for g in groups if g["bucket"] == "high"),
-                    "review": sum(1 for g in groups if g["bucket"] == "review"),
-                    "unmatched": sum(1 for g in groups if g["bucket"] == "unmatched"),
-                    "elapsed_seconds": elapsed,
-                }
-                st.session_state["bulk_failures"] = scan["failures"]
-                # A fresh scan always starts with a fresh decision state — setdefault()
-                # here would let an Approve/Skip/Applied decision from a PREVIOUS scan
-                # leak into this one whenever the same sheet row's group_key recurs
-                # (e.g. the same application matched again), showing it as already
-                # decided before this scan's results were even reviewed.
-                st.session_state["bulk_group_decisions"] = {}
-                # A group's group_key is deterministic (target_sheet + row, or company/
-                # role for a new-application group), so the SAME key recurs whenever a
-                # later scan matches the same application again. Streamlit widgets only
-                # honor index=/value= the first time a given key is created — on a
-                # repeat key they silently keep whatever the widget last held, which
-                # made the Status dropdown (and every other per-group field) show a
-                # stale leftover choice from an earlier scan instead of the freshly
-                # computed proposal. Bumping this counter gives every scan's widgets a
-                # brand-new key namespace so their defaults are always honored.
-                st.session_state["bulk_scan_id"] = st.session_state.get("bulk_scan_id", 0) + 1
-        except Exception as e:
-            app._flash("error", f"Gmail scan failed: {e}")
-        finally:
-            st.session_state["bulk_scanning"] = False
-            st.rerun()
+    def _finalize(cancelled: bool) -> None:
+        groups = group_results(runtime["results"])
+        elapsed = time.monotonic() - runtime["start_time"]
+        providers = st.session_state.get("llm_providers_used", [])
+        st.session_state["bulk_groups"] = groups
+        st.session_state["bulk_scan_summary"] = {
+            "scanned": total, "cancelled": cancelled, "processed_before_stop": processed,
+            "skipped": runtime["counts"]["already_processed_skipped"],
+            "sent_skipped": runtime["counts"]["own_skipped"],
+            "failed": len(runtime["failures"]),
+            "extraction_failures": sum(1 for f in runtime["failures"] if f.get("stage") == "extract"),
+            "ai_calls_attempted": runtime["ai_calls_attempted"],
+            "llm_retries": st.session_state.get("llm_extract_retries", 0),
+            "openrouter_successes": providers.count("openrouter"),
+            "groq_successes": providers.count("groq"),
+            "groups": len(groups),
+            "high": sum(1 for g in groups if g["bucket"] == "high"),
+            "review": sum(1 for g in groups if g["bucket"] == "review"),
+            "unmatched": sum(1 for g in groups if g["bucket"] == "unmatched"),
+            "elapsed_seconds": elapsed,
+        }
+        st.session_state["bulk_failures"] = runtime["failures"]
+        # A fresh scan always starts with a fresh decision state — setdefault() here
+        # would let an Approve/Skip/Applied decision from a PREVIOUS scan leak into this
+        # one whenever the same sheet row's group_key recurs (e.g. the same application
+        # matched again), showing it as already decided before this scan's results were
+        # even reviewed.
+        st.session_state["bulk_group_decisions"] = {}
+        # A group's group_key is deterministic (target_sheet + row, or company/role for
+        # a new-application group), so the SAME key recurs whenever a later scan matches
+        # the same application again. Streamlit widgets only honor index=/value= the
+        # first time a given key is created — on a repeat key they silently keep
+        # whatever the widget last held, which made the Status dropdown (and every other
+        # per-group field) show a stale leftover choice from an earlier scan instead of
+        # the freshly computed proposal. Bumping this counter gives every scan's widgets
+        # a brand-new key namespace so their defaults are always honored.
+        st.session_state["bulk_scan_id"] = st.session_state.get("bulk_scan_id", 0) + 1
+        st.session_state["bulk_scan_runtime"] = None
+        st.session_state["bulk_scanning"] = False
+
+    if cancel_clicked:
+        _finalize(cancelled=True)
+        app._flash("warning", f"Scan cancelled after {processed}/{total} message(s) — partial results are shown below.")
+        st.rerun()
+        return
+
+    if processed >= total:
+        _finalize(cancelled=False)
+        st.rerun()
+        return
+
+    # Process exactly ONE message this rerun, then trigger the next one. Each tick is
+    # short (dominated by the message's own fetch+LLM latency, not by Streamlit's rerun
+    # overhead), so the Cancel button above is always freshly rendered and interactive
+    # again well before the next message finishes — unlike a single blocking call over
+    # the whole range, where a widget click can't be acted on until it returns.
+    runtime["current"] = _scan_step(runtime, runtime["ids"][processed])
+    runtime["index"] += 1
+    st.rerun()
 
 
 def _render_scan_summary() -> None:
     s = st.session_state["bulk_scan_summary"]
+    if s.get("cancelled"):
+        st.warning(
+            f"⚠️ Scan cancelled after {s.get('processed_before_stop', 0)} / {s['scanned']} message(s) — "
+            "results below reflect only what was processed before you cancelled."
+        )
     st.success(
         f"**{s['scanned']} Gmail messages found** — {s.get('ai_calls_attempted', 0)} analyzed by AI, "
         f"{s['skipped']} already processed, {s.get('sent_skipped', 0)} own sent skipped, "
