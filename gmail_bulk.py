@@ -22,6 +22,7 @@ so every app.<name> reference below resolves against the single real instance.
 import base64
 import json
 import re
+import time
 from datetime import date, datetime, timedelta
 
 import streamlit as st
@@ -404,24 +405,47 @@ def build_email_text(msg: dict) -> str:
 
 # ── Scan (read-only) ─────────────────────────────────────────────────────────
 
-def scan_period(creds, label: str, start: date, end: date) -> dict:
+def scan_period(creds, label: str, start: date, end: date, progress_cb=None) -> dict:
     """Pure read: lists + fetches Gmail messages, extracts + matches each one via the
     reused app.py functions. NEVER calls update_job_from_email/append_job. One bad
-    email is caught and recorded, never aborts the batch."""
+    email is caught and recorded, never aborts the batch.
+
+    progress_cb, if given, is called synchronously (no threads/concurrency — sequential
+    processing stays as-is, only visibility is added) at every point the loop advances,
+    with a small dict: {"phase": "start", "total": N} once up front, then {"phase":
+    "progress", "total", "processed", "parsed_ok", "own_skipped",
+    "already_processed_skipped", "failed", "current"} after every message (success,
+    skip, or failure alike). "current" is None or {"date", "company", "role",
+    "subject"} only — never the email body, tokens, or raw exception text."""
     service = build_gmail_service(creds)
     query = build_query(label, start, end)
     processed_ids = load_processed_ids()
     own_email = get_own_email_address(service)
 
     ids = list_message_ids(service, query)
+    if progress_cb:
+        progress_cb({"phase": "start", "total": len(ids)})
+
     results, failures = [], []
     skipped = 0
     sent_skipped = 0
+    ai_calls_attempted = 0
     jobs_cache: dict = {}
 
-    for msg_id in ids:
+    counts = {"parsed_ok": 0, "own_skipped": 0, "already_processed_skipped": 0, "failed": 0}
+
+    def _tick(current=None):
+        if progress_cb:
+            progress_cb({
+                "phase": "progress", "total": len(ids), "processed": processed,
+                "current": current, **counts,
+            })
+
+    for processed, msg_id in enumerate(ids, start=1):
         if msg_id in processed_ids:
             skipped += 1
+            counts["already_processed_skipped"] += 1
+            _tick(None)
             continue
 
         subject_for_error = ""
@@ -429,20 +453,27 @@ def scan_period(creds, label: str, start: date, end: date) -> dict:
             msg = fetch_message(service, msg_id)
             subject_for_error = msg.get("subject", "")
         except Exception as e:
-            failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e)})
+            failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e), "stage": "fetch"})
+            counts["failed"] += 1
+            _tick(None)
             continue
 
         # Deterministic, no LLM cost: our own replies inside a labeled recruiter thread
         # (e.g. "thanks for the update") aren't job-status signals worth extracting.
         if own_email and _parse_email_address(msg["from"]) == own_email:
             sent_skipped += 1
+            counts["own_skipped"] += 1
+            _tick({"date": msg.get("date_header", ""), "company": "", "role": "", "subject": msg.get("subject", "")})
             continue
 
         try:
             email_text = build_email_text(msg)
+            ai_calls_attempted += 1
             info = app.extract_email_info(email_text)
         except Exception as e:
-            failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e)})
+            failures.append({"id": msg_id, "subject": subject_for_error, "error": str(e), "stage": "extract"})
+            counts["failed"] += 1
+            _tick({"date": "", "company": "", "role": "", "subject": subject_for_error})
             continue
 
         target_sheet = app._archive_sheet_for_email_date(info.get("email_date", ""))
@@ -451,7 +482,9 @@ def scan_period(creds, label: str, start: date, end: date) -> dict:
             try:
                 jobs_cache[cache_key] = app.get_all_jobs(app.get_worksheet(target_sheet))
             except Exception as e:
-                failures.append({"id": msg_id, "subject": subject_for_error, "error": f"Could not load sheet: {e}"})
+                failures.append({"id": msg_id, "subject": subject_for_error, "error": f"Could not load sheet: {e}", "stage": "sheet"})
+                counts["failed"] += 1
+                _tick(None)
                 continue
         jobs = jobs_cache[cache_key]
 
@@ -470,10 +503,15 @@ def scan_period(creds, label: str, start: date, end: date) -> dict:
             "ambiguous_rows": ambiguous_rows,
             "info": info,
         })
+        counts["parsed_ok"] += 1
+        _tick({
+            "date": info.get("email_date", ""), "company": info.get("matched_company", ""),
+            "role": info.get("matched_role", ""), "subject": msg.get("subject", ""),
+        })
 
     return {
         "results": results, "failures": failures, "skipped_processed": skipped,
-        "sent_skipped": sent_skipped, "scanned": len(ids),
+        "sent_skipped": sent_skipped, "scanned": len(ids), "ai_calls_attempted": ai_calls_attempted,
     }
 
 
@@ -483,8 +521,30 @@ def _norm_key(company: str, role: str) -> tuple:
     return (app.normalize_company(company or ""), app.normalize_role(role or ""))
 
 
+def _best_event_dt(item: dict) -> datetime:
+    """Best-available timestamp for one email, in the priority order the spec calls
+    for: 1) the AI's own email_datetime (has real time-of-day), 2) the AI's own
+    email_date (midnight), 3) Gmail's own internalDate as a deterministic fallback that
+    never fails to parse. Used for chronological sort, timeline display, and the
+    temporal-anchor grouping below — never for anything written to the sheet."""
+    info = item["info"]
+    dt_str = (info.get("email_datetime") or "").strip()
+    if dt_str:
+        try:
+            return datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+    d_str = (info.get("email_date") or "").strip()
+    if d_str:
+        try:
+            return datetime.strptime(d_str, "%Y-%m-%d")
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(item["internal_date_ms"] / 1000)
+
+
 def _sorted_chrono(items: list) -> list:
-    return sorted(items, key=lambda r: r["internal_date_ms"])
+    return sorted(items, key=_best_event_dt)
 
 
 def _latest_existing_comment_date(company_comments: str) -> date | None:
@@ -498,17 +558,15 @@ def _latest_existing_comment_date(company_comments: str) -> date | None:
 
 
 def _pick_best_contact(items: list) -> str:
+    """items must already be chronologically sorted (see _build_group). The most
+    RECENT real contact wins — a later email naming a new recruiter supersedes an
+    earlier one, even if the earlier text happened to look more "complete"."""
     best = ""
     for r in items:
         c = (r["info"].get("contact_person") or "").strip()
         if app._is_blank_field(c):
             continue
-        if not best:
-            best = c
-            continue
-        score = lambda v: (("@" in v), (sum(ch.isdigit() for ch in v) >= 6), len(v))
-        if score(c) > score(best):
-            best = c
+        best = c
     return best
 
 
@@ -553,11 +611,13 @@ def _build_group(kind: str, key: tuple, items: list) -> dict:
             group["current_contact"] = row.get("Contact Person", "")
             group["current_company_comments"] = row.get("Company Comments", "")
             existing_latest = _latest_existing_comment_date(group["current_company_comments"])
-            try:
-                batch_dt = datetime.strptime(latest["info"].get("email_date", ""), "%Y-%m-%d").date()
-            except ValueError:
-                batch_dt = None
-            if existing_latest and batch_dt and existing_latest > batch_dt:
+            # _best_event_dt always resolves to something (Gmail's own internalDate is
+            # a deterministic last resort), so this batch date is available even when
+            # the AI didn't extract a usable email_date — unlike checking
+            # info["email_date"] alone, which used to silently skip the conflict check
+            # whenever that one field was missing.
+            batch_dt = _best_event_dt(latest).date()
+            if existing_latest and existing_latest > batch_dt:
                 group["conflict"] = True
 
     if group["ambiguous_rows"]:
@@ -589,23 +649,78 @@ def _build_group(kind: str, key: tuple, items: list) -> dict:
 
 
 def group_results(results: list) -> list:
-    matched, unmatched_new, singles = {}, {}, []
+    """Groups scanned emails into review items. Identity hierarchy (deterministic, no
+    LLM decides this):
+
+    1. A matched worksheet+row is the strongest signal — every email resolved to the
+       same row is unquestionably one group, regardless of wording variation.
+    2. Ambiguous matches (fuzzy_find_job found >1 candidate row) are NEVER folded into
+       the temporal grouping below — they stay their own single review item so the user
+       explicitly picks the row. Safety over convenience.
+    3. For emails with no row match at all: a "new application confirmation" email
+       (is_new_application_confirmation=true, not ambiguous) becomes an ANCHOR, keyed by
+       (target_sheet, normalize_company, normalize_role) — exact string equality, not
+       fuzzy_find_job's substring matching, so e.g. "Engineering Manager" vs "Senior
+       Engineering Manager" never collapse into each other. The SAME key can have
+       several anchors (one per confirmation email) — the same person can genuinely
+       apply to the same company+role more than once, and each confirmation starts a
+       new, separate application group rather than merging into an older one.
+    4. Every other no-row-match email (not itself a confirmation) attaches to the most
+       RECENT anchor of its own exact key that is dated on or before it — i.e. the
+       still-open application as of that email's date. If no anchor qualifies (none
+       exists yet for that key, or every anchor for that key is dated after it), the
+       email stays its own single item for manual review rather than being guessed at.
+       This is what turns a confirmation + a later "unfortunately..." for the same
+       untracked company+role into one proposed new application, while keeping two
+       separate applications to the same company+role (each with its own confirmation)
+       as two distinct groups.
+    """
+    matched: dict = {}
+    anchors: dict = {}   # norm key -> list of (anchor_dt, items) — one entry per anchor
+    candidates: list = []
+    review_singles: list = []
 
     for r in results:
         if r["matched_row"] is not None:
             key = ("row", r["target_sheet"], r["matched_row"])
             matched.setdefault(key, []).append(r)
-        elif not r["ambiguous_rows"] and r["info"].get("is_new_application_confirmation"):
-            key = ("new", r["target_sheet"]) + _norm_key(
+        elif r["ambiguous_rows"]:
+            review_singles.append(r)
+        elif r["info"].get("is_new_application_confirmation"):
+            key = (r["target_sheet"],) + _norm_key(
                 r["info"].get("matched_company", ""), r["info"].get("matched_role", "")
             )
-            unmatched_new.setdefault(key, []).append(r)
+            anchors.setdefault(key, []).append(r)
         else:
-            singles.append(r)
+            candidates.append(r)
+
+    anchor_buckets: dict = {}  # key -> list of (anchor_dt, items_list), one per anchor
+    for key, items in anchors.items():
+        anchor_buckets[key] = [(_best_event_dt(it), [it]) for it in sorted(items, key=_best_event_dt)]
+
+    for r in sorted(candidates, key=_best_event_dt):
+        key = (r["target_sheet"],) + _norm_key(
+            r["info"].get("matched_company", ""), r["info"].get("matched_role", "")
+        )
+        r_dt = _best_event_dt(r)
+        best_anchor = None
+        for anchor_dt, bucket in anchor_buckets.get(key, []):
+            if anchor_dt <= r_dt and (best_anchor is None or anchor_dt > best_anchor[0]):
+                best_anchor = (anchor_dt, bucket)
+        if best_anchor:
+            best_anchor[1].append(r)
+        else:
+            review_singles.append(r)
 
     groups = [_build_group("matched", k, v) for k, v in matched.items()]
-    groups += [_build_group("new", k, v) for k, v in unmatched_new.items()]
-    groups += [_build_group("single", ("single", r["message_id"]), [r]) for r in singles]
+    for key, bucket_list in anchor_buckets.items():
+        for anchor_dt, items in bucket_list:
+            # The anchor email's own message_id disambiguates multiple anchors that
+            # share the same normalized company+role key (Part 10: repeated
+            # applications), so each gets a distinct, stable group_key.
+            group_key = ("new",) + key + (items[0]["message_id"],)
+            groups.append(_build_group("new", group_key, items))
+    groups += [_build_group("single", ("single", r["message_id"]), [r]) for r in review_singles]
     return groups
 
 
@@ -648,12 +763,22 @@ def _apply_new(group: dict, target_sheet, overrides: dict) -> dict:
     items = group["items"]
     earliest = items[0]
     comment_overrides = overrides.get("comments") or {}
-    combined_comments = "\n".join(
-        line
-        for i in items
-        for line in (comment_overrides.get(i["message_id"], i["info"].get("company_comments", "")) or "").splitlines()
-        if line.strip()
-    )
+    seen_lines: set = set()
+    combined_lines = []
+    for i in items:
+        text = comment_overrides.get(i["message_id"], i["info"].get("company_comments", "")) or ""
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            key = line.strip()
+            # Multiple emails in the same consolidated timeline (e.g. an auto-ack
+            # duplicating the confirmation's own wording) can carry an identical bullet
+            # — skip an exact repeat rather than writing it into the sheet twice.
+            if key in seen_lines:
+                continue
+            seen_lines.add(key)
+            combined_lines.append(line)
+    combined_comments = "\n".join(combined_lines)
     date_applied = earliest["info"].get("email_datetime", "") or ""
     if not date_applied:
         ed = earliest["info"].get("email_date", "")
@@ -732,6 +857,13 @@ def render_bulk_email_tab() -> None:
         _render_apply_controls()
 
 
+def _format_hms(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def _render_scan_controls() -> None:
     period = st.selectbox("Period", [PERIOD_2025, PERIOD_JAN_JUL_2026, PERIOD_CUSTOM], key="bulk_period")
     custom_start = custom_end = None
@@ -755,28 +887,73 @@ def _render_scan_controls() -> None:
     if not st.session_state.get("bulk_scanning"):
         return
 
+    # Reset per-scan LLM counters (Part 2) so the summary below reflects only THIS
+    # scan, not whatever accumulated in a previous one.
+    st.session_state["llm_providers_used"] = []
+    st.session_state["llm_extract_retries"] = 0
+
+    start, end = _period_bounds(
+        st.session_state["bulk_scan_period"],
+        st.session_state.get("bulk_scan_custom_start"),
+        st.session_state.get("bulk_scan_custom_end"),
+    )
+    label = st.session_state["bulk_scan_label"]
+    query = build_query(label, start, end)
+    st.caption(f"Gmail query: `{query}`")
+
+    progress_bar = st.progress(0.0)
+    status_ph = st.empty()
+    start_time = time.monotonic()
+
+    def _on_progress(update: dict) -> None:
+        if update["phase"] == "start":
+            status_ph.markdown(f"Found **{update['total']}** message(s) — starting analysis...")
+            return
+        total, processed = update["total"], update["processed"]
+        progress_bar.progress((processed / total) if total else 1.0)
+        pct = int(processed / total * 100) if total else 100
+        lines = [
+            f"**Processing {processed} / {total} — {pct}%**",
+            f"Parsed: {update['parsed_ok']} · Own sent skipped: {update['own_skipped']} · "
+            f"Already processed: {update['already_processed_skipped']} · Failed: {update['failed']}",
+        ]
+        current = update.get("current") or {}
+        cur_bits = " — ".join(v for v in (current.get("date"), current.get("company"), current.get("role"), current.get("subject")) if v)
+        if cur_bits:
+            lines.append(f"Current: {cur_bits}")
+        elapsed = time.monotonic() - start_time
+        lines.append(f"Elapsed: {_format_hms(elapsed)}")
+        if processed >= 10 and processed < total:
+            remaining_min = max(1, round(elapsed / processed * (total - processed) / 60))
+            lines.append(f"Estimated remaining: ~{remaining_min} min (approximate)")
+        status_ph.markdown("  \n".join(lines))
+
     with st.spinner("Scanning Gmail — this can take a while for large date ranges..."):
         try:
             creds = get_valid_credentials()
             if not creds:
                 app._flash("error", "Gmail connection expired — please reconnect.")
             else:
-                start, end = _period_bounds(
-                    st.session_state["bulk_scan_period"],
-                    st.session_state.get("bulk_scan_custom_start"),
-                    st.session_state.get("bulk_scan_custom_end"),
-                )
-                scan = scan_period(creds, st.session_state["bulk_scan_label"], start, end)
+                scan = scan_period(creds, label, start, end, progress_cb=_on_progress)
                 groups = group_results(scan["results"])
+                elapsed = time.monotonic() - start_time
+                providers = st.session_state.get("llm_providers_used", [])
                 st.session_state["bulk_groups"] = groups
                 st.session_state["bulk_scan_summary"] = {
                     "scanned": scan["scanned"],
                     "skipped": scan["skipped_processed"],
                     "sent_skipped": scan["sent_skipped"],
                     "failed": len(scan["failures"]),
+                    "extraction_failures": sum(1 for f in scan["failures"] if f.get("stage") == "extract"),
+                    "ai_calls_attempted": scan["ai_calls_attempted"],
+                    "llm_retries": st.session_state.get("llm_extract_retries", 0),
+                    "openrouter_successes": providers.count("openrouter"),
+                    "groq_successes": providers.count("groq"),
+                    "groups": len(groups),
                     "high": sum(1 for g in groups if g["bucket"] == "high"),
                     "review": sum(1 for g in groups if g["bucket"] == "review"),
                     "unmatched": sum(1 for g in groups if g["bucket"] == "unmatched"),
+                    "elapsed_seconds": elapsed,
                 }
                 st.session_state["bulk_failures"] = scan["failures"]
                 # A fresh scan always starts with a fresh decision state — setdefault()
@@ -805,15 +982,20 @@ def _render_scan_controls() -> None:
 def _render_scan_summary() -> None:
     s = st.session_state["bulk_scan_summary"]
     st.success(
-        f"**{s['scanned']} emails scanned** — {s['skipped']} already processed (skipped), "
-        f"{s.get('sent_skipped', 0)} sent messages skipped, {s['failed']} failed to parse.\n\n"
-        f"🟢 {s['high']} high confidence · 🟡 {s['review']} need review · 🆕 {s['unmatched']} unmatched/new"
+        f"**{s['scanned']} Gmail messages found** — {s.get('ai_calls_attempted', 0)} analyzed by AI, "
+        f"{s['skipped']} already processed, {s.get('sent_skipped', 0)} own sent skipped, "
+        f"{s.get('extraction_failures', s['failed'])} extraction failures.\n\n"
+        f"**{s.get('groups', s['high'] + s['review'] + s['unmatched'])} application group(s)** — "
+        f"🟢 {s['high']} high confidence · 🟡 {s['review']} need review (incl. ambiguous) · "
+        f"🆕 {s['unmatched']} unmatched/new.\n\n"
+        f"LLM: {s.get('openrouter_successes', 0)} OpenRouter · {s.get('groq_successes', 0)} Groq fallback · "
+        f"{s.get('llm_retries', 0)} retry/recovery — elapsed {_format_hms(s.get('elapsed_seconds', 0))}."
     )
     failures = st.session_state.get("bulk_failures", [])
     if failures:
-        with st.expander(f"⚠️ {len(failures)} failed to parse — review manually"):
+        with st.expander(f"⚠️ {len(failures)} failed — review manually"):
             for f in failures:
-                st.caption(f"• {f.get('subject', '(no subject)')} — {f['error']}")
+                st.caption(f"• [{f.get('stage', '?')}] {f.get('subject', '(no subject)')} — {f['error']}")
 
 
 def _render_review_queue() -> None:
@@ -840,10 +1022,11 @@ def _render_group(g: dict) -> None:
     sk = st.session_state.get("bulk_scan_id", 0)
 
     sheet_label = g["target_sheet"] or _default_sheet_title()
+    email_word = "1 email" if g["email_count"] == 1 else f"{g['email_count']} emails consolidated"
     header = f"{g['company']} — {g['role']} · {sheet_label}"
     if g["matched_row"]:
         header += f" · Row {g['matched_row']}"
-    header += f" · {g['email_count']} email(s)"
+    header += f" · {email_word}"
     icon = {"approve": "✅ ", "skip": "⏭️ ", "applied": "🟢 ", "failed": "❌ "}.get(decision["action"], "")
 
     with st.expander(f"{icon}{header}"):
@@ -852,6 +1035,10 @@ def _render_group(g: dict) -> None:
                 st.success("Applied.")
             else:
                 st.error(f"Failed: {decision.get('error', 'unknown error')}")
+
+        if g["matched_row"]:
+            st.caption(f"Matched: {sheet_label} sheet · row {g['matched_row']}")
+        st.caption(email_word)
 
         if g["conflict"]:
             st.warning(
@@ -877,6 +1064,20 @@ def _render_group(g: dict) -> None:
                 )
             else:
                 st.caption("_(none yet)_")
+
+        # Read-only chronological overview — only worth showing once there's more than
+        # one event to consolidate (a single-email group is already fully summarized by
+        # "1 email" above, per the no-unnecessary-complexity rule).
+        if len(g["items"]) > 1:
+            st.markdown("**Timeline:**")
+            for item in g["items"]:
+                info = item["info"]
+                event_date = info.get("email_date", "") or _best_event_dt(item).strftime("%Y-%m-%d")
+                status = info.get("new_status", "") or "?"
+                st.markdown(f"✓ {event_date} — {status}")
+                for line in (info.get("company_comments", "") or "").splitlines():
+                    if line.strip():
+                        st.caption(f"　{line.strip()}")
 
         st.markdown("**Comments that will be appended if approved** — edit any of these before approving:")
         comment_edits = {}

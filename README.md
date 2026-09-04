@@ -389,6 +389,23 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   each Gmail message only *after* its update/creation is successfully applied — never
   merely for being scanned. Re-scanning the same period skips already-applied messages,
   so nothing gets duplicated and nothing gets re-billed to the AI.
+- **Live progress during a scan**: a progress bar and status line show messages
+  processed so far, running counts (parsed / skipped / failed), the current message's
+  date/company/role/subject (never the email body), elapsed time, and — once enough
+  messages have been processed — an approximate ETA. A large historical scan can still
+  take a long time; you can now see it moving.
+- **Emails are consolidated into one application timeline**: multiple emails for the
+  same tracked row are always one group, regardless of wording. Untracked emails are
+  grouped by company+role only when a "thank you for applying"-style confirmation email
+  anchors them — a later status update for the same company+role joins that group, but
+  two genuinely separate applications to the same company+role (each with its own
+  confirmation) stay as two groups. Anything uncertain stays its own item for you to
+  review rather than being merged automatically.
+- **Final proposed status is whichever event is chronologically latest** in a group's
+  timeline — not a fixed hierarchy (e.g. Applied → Interview → Rejected proposes
+  Rejected; Applied → Interview → Assessment proposes Assessment). The existing
+  safeguard still applies: if the sheet already has a more recent update than this
+  batch, you'll see the conflict warning instead of a silent downgrade.
 - **Where the Gmail token is stored**: a **hidden worksheet tab** (`_gmail_oauth_token`)
   in the same spreadsheet, not local disk — Streamlit Cloud wipes local disk on every
   redeploy (which happens on every git push to this repo), so a local token file would
@@ -400,7 +417,8 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
 ### Known limitations
 
 - Large scans page through Gmail's API sequentially (list + fetch per message, no batch
-  requests yet) — hundreds of messages will take a while but will complete.
+  requests yet) — hundreds of messages will take a while but will complete, with live
+  progress shown throughout.
 - The Gmail label filter matches Gmail's own `label:"..."` search syntax; if your label
   name differs, change the label field in the Bulk Email Update tab (it doesn't have to
   be `Jobsearch`, that's just the default).

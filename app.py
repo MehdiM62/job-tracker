@@ -320,6 +320,17 @@ Return ONLY a JSON object with these fields:
 }}"""
 
 
+def _canonical_status(value) -> str:
+    """Case-insensitive match against STATUSES, returning the canonical cased value —
+    or the original string unchanged if it doesn't match any status at all. See the
+    comment in extract_email_info() for why this exists."""
+    v = str(value or "").strip()
+    for s in STATUSES:
+        if v.lower() == s.lower():
+            return s
+    return v
+
+
 def _looks_garbled(result: dict) -> bool:
     """Cheap sanity check for a technically-valid-JSON but semantically broken response —
     an occasional provider-level generation artifact observed in testing (e.g.
@@ -343,8 +354,22 @@ def extract_email_info(email_text: str) -> dict:
     _archive_sheet_for_email_date — so it isn't known until this call returns)."""
     prompt = _email_extract_prompt(email_text)
     result = call_llm(prompt)
+    # Investigated (bulk-scan request-count spec): a bulk scan of 200+ emails was
+    # producing substantially more than 200 OpenRouter requests. Root cause found here —
+    # _looks_garbled() compares new_status against STATUSES with no case normalization,
+    # unlike status_confidence/new_application_confidence below. A perfectly valid
+    # "applied" (lower-case) response was therefore misread as garbled and burned a full
+    # extra LLM round-trip for nothing. Canonicalizing casing BEFORE the garbled check
+    # fixes that false positive without weakening the check itself — a genuinely wrong
+    # status word still fails _canonical_status's match and still triggers the retry.
+    result["new_status"] = _canonical_status(result.get("new_status"))
     if _looks_garbled(result):
+        try:
+            st.session_state["llm_extract_retries"] = st.session_state.get("llm_extract_retries", 0) + 1
+        except Exception:
+            pass
         result = call_llm(prompt)  # one retry — this failure mode has been observed to be transient
+        result["new_status"] = _canonical_status(result.get("new_status"))
     result["company_comments"] = format_bullets(result.get("company_comments", ""))
     # Models don't always match the prompt's lowercase "high/medium/low" casing exactly;
     # normalize so the UI's dict lookups (keyed on lowercase) don't silently fall through.

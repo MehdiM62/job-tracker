@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Lightweight, dependency-free checks for gmail_bulk.py's scan/grouping/apply logic.
+
+Run with: python3 test_gmail_bulk.py
+
+No live Gmail or Google Sheets access is used. app.py is loaded exactly the way the
+running app injects it into gmail_bulk (see gmail_bulk.py's module docstring), so
+normalize_company/normalize_role/fuzzy_find_job/_is_blank_field/_canonical_status are
+the REAL logic — only the Sheets-network calls (get_worksheet/get_all_jobs) and the
+Gmail-network calls (used in the scan_period tests) are replaced with small in-memory
+stand-ins.
+"""
+import importlib.util
+import inspect
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _load_app_module():
+    spec = importlib.util.spec_from_file_location("app", REPO_ROOT / "app.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["app"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+appmod = _load_app_module()
+
+import gmail_bulk as gb  # noqa: E402
+
+gb.app = appmod
+
+JOBS_BY_SHEET: dict = {}
+appmod.get_worksheet = lambda sheet_name=None: sheet_name
+appmod.get_all_jobs = lambda ws: JOBS_BY_SHEET.get(ws, [])
+# _default_sheet_title() reads st.session_state, which isn't available outside a real
+# Streamlit script run — stub it so the apply-path tests below don't need one.
+gb._default_sheet_title = lambda: "current"
+
+failures = []
+
+
+def check(name: str, condition: bool) -> None:
+    print(f"[{'PASS' if condition else 'FAIL'}] {name}")
+    if not condition:
+        failures.append(name)
+
+
+def mk_info(company, role, status, email_date, confirmation=False, comments="", contact="Not specified", dt=""):
+    return {
+        "matched_company": company, "matched_role": role, "contact_person": contact,
+        "email_date": email_date, "email_datetime": dt,
+        "new_status": status, "status_confidence": "high",
+        "company_comments": comments or f"• {status}",
+        "is_new_application_confirmation": confirmation,
+        "new_application_confidence": "high" if confirmation else "low",
+    }
+
+
+def mk_result(msg_id, subject, target_sheet, matched_row, ambiguous_rows, info, ms):
+    return {
+        "message_id": msg_id, "thread_id": msg_id + "-t", "subject": subject,
+        "internal_date_ms": ms, "target_sheet": target_sheet,
+        "matched_row": matched_row, "ambiguous_rows": ambiguous_rows, "info": info,
+    }
+
+
+def ms_for(y, m, d):
+    return int(datetime(y, m, d).timestamp() * 1000)
+
+
+# ── Part 11 fix: status-casing no longer trips the garbled-retry false positive ──
+def test_canonical_status_fixes_case_sensitivity():
+    check("lowercase status normalized to canonical casing", appmod._canonical_status("applied") == "Applied")
+    check("already-canonical status left unchanged", appmod._canonical_status("Rejected") == "Rejected")
+    check("unrecognized status left as-is (still triggers garbled detection)", appmod._canonical_status("N/A") == "N/A")
+    check(
+        "a differently-cased but valid status no longer looks garbled",
+        not appmod._looks_garbled({"matched_company": "X", "matched_role": "Y", "new_status": appmod._canonical_status("applied")}),
+    )
+
+
+# ── Case 1: single email -> one group, Applied ──────────────────────────────
+def test_single_email_one_group():
+    JOBS_BY_SHEET[None] = []
+    r = mk_result("m1", "App received", None, None, [], mk_info("Acme", "Data Analyst", "Applied", "2026-01-05", confirmation=True), ms_for(2026, 1, 5))
+    groups = gb.group_results([r])
+    check("single email -> exactly one group", len(groups) == 1)
+    check("single email group proposed status Applied", groups[0]["proposed_status"] == "Applied")
+    check("single email group has 1 item", groups[0]["email_count"] == 1)
+
+
+# ── Case 2/3: matched row, 3-event timeline, final Rejected; role wording differs ──
+def test_matched_row_timeline_and_role_wording():
+    JOBS_BY_SHEET[None] = [{
+        "No.": "10", "Company": "Acme GmbH", "Role": "Senior PM", "Status": "Applied",
+        "Contact Person": "Not specified", "Company Comments": "", "Date Applied": "2026-01-01",
+    }]
+    items = [
+        mk_result("m1", "Applied", None, 10, [], mk_info("Acme", "Senior Product Manager", "Applied", "2026-01-02"), ms_for(2026, 1, 2)),
+        mk_result("m2", "Interview", None, 10, [], mk_info("Acme", "Senior PM (Product)", "Interview", "2026-01-10"), ms_for(2026, 1, 10)),
+        mk_result("m3", "Rejected", None, 10, [], mk_info("Acme", "Sr. Product Manager", "Rejected", "2026-01-20"), ms_for(2026, 1, 20)),
+    ]
+    groups = gb.group_results(items)
+    check("same matched row with differently-worded roles -> one group", len(groups) == 1)
+    g = groups[0]
+    check("timeline has 3 events", g["email_count"] == 3)
+    check("final proposed status is the LATEST event, not a hierarchy", g["proposed_status"] == "Rejected")
+    check("items are chronologically sorted", [it["message_id"] for it in g["items"]] == ["m1", "m2", "m3"])
+
+
+# ── Case 4: same company, two different roles -> two groups ────────────────
+def test_same_company_different_roles_stay_separate():
+    JOBS_BY_SHEET[None] = []
+    r1 = mk_result("m1", "EM app", None, None, [], mk_info("Beta Inc", "Engineering Manager", "Applied", "2026-02-01", confirmation=True), ms_for(2026, 2, 1))
+    r2 = mk_result("m2", "Sr EM app", None, None, [], mk_info("Beta Inc", "Senior Engineering Manager", "Applied", "2026-02-02", confirmation=True), ms_for(2026, 2, 2))
+    groups = gb.group_results([r1, r2])
+    check("Engineering Manager vs Senior Engineering Manager stay separate", len(groups) == 2)
+
+
+# ── Case 5: missing row, confirmation + later rejection, same company+role -> one new group ──
+def test_confirmation_then_later_rejection_becomes_one_new_group():
+    JOBS_BY_SHEET[None] = []
+    confirm = mk_result("m1", "Thanks for applying", None, None, [], mk_info("Gamma AG", "Data Engineer", "Applied", "2026-03-01", confirmation=True), ms_for(2026, 3, 1))
+    reject = mk_result("m2", "Unfortunately...", None, None, [], mk_info("Gamma AG", "Data Engineer", "Rejected", "2026-03-15"), ms_for(2026, 3, 15))
+    groups = gb.group_results([confirm, reject])
+    check("confirmation + later rejection -> one group", len(groups) == 1)
+    g = groups[0]
+    check("group kind is new", g["kind"] == "new")
+    check("proposed status is Rejected", g["proposed_status"] == "Rejected")
+    check("earliest item is the confirmation (Date Applied source)", g["items"][0]["message_id"] == "m1")
+
+
+# ── Case 6: two separate applications, same company+role, months apart ─────
+def test_two_separate_confirmations_same_company_role_stay_separate():
+    JOBS_BY_SHEET[None] = []
+    c1 = mk_result("m1", "Thanks", None, None, [], mk_info("Delta SE", "Consultant", "Applied", "2026-01-05", confirmation=True), ms_for(2026, 1, 5))
+    r1 = mk_result("m2", "Rejected", None, None, [], mk_info("Delta SE", "Consultant", "Rejected", "2026-01-20"), ms_for(2026, 1, 20))
+    c2 = mk_result("m3", "Thanks again", None, None, [], mk_info("Delta SE", "Consultant", "Applied", "2026-06-01", confirmation=True), ms_for(2026, 6, 1))
+    groups = gb.group_results([c1, r1, c2])
+    check("two confirmations months apart -> two groups", len(groups) == 2)
+    by_first = {g["items"][0]["message_id"]: g for g in groups}
+    check("the follow-up attaches to the FIRST confirmation, not the second", len(by_first.get("m1", {"items": []})["items"]) == 2)
+    check("the second confirmation stands alone (no later email yet)", len(by_first.get("m3", {"items": []})["items"]) == 1)
+
+
+# ── Case 7: ambiguous match -> stays its own review item, never silently merged ──
+def test_ambiguous_never_merged():
+    JOBS_BY_SHEET[None] = []
+    r = mk_result("m1", "Update", None, None, [11, 12], mk_info("Epsilon", "Analyst", "Interview", "2026-04-01"), ms_for(2026, 4, 1))
+    groups = gb.group_results([r])
+    check("ambiguous match stays its own group", len(groups) == 1)
+    check("ambiguous group bucket is review", groups[0]["bucket"] == "review")
+    check("ambiguous_rows preserved for the user to pick", groups[0]["ambiguous_rows"] == [11, 12])
+
+
+# ── Case 8: existing sheet comment newer than this batch -> conflict flag stays ──
+def test_conflict_protection_kept():
+    JOBS_BY_SHEET[None] = [{
+        "No.": "20", "Company": "Zeta", "Role": "Coach", "Status": "Offer",
+        "Contact Person": "Jane", "Company Comments": "📧 2026-05-20 | Status: Offer\nGot an offer",
+        "Date Applied": "2026-04-01",
+    }]
+    r = mk_result("m1", "Interview invite", None, 20, [], mk_info("Zeta", "Coach", "Interview", "2026-05-01"), ms_for(2026, 5, 1))
+    groups = gb.group_results([r])
+    check("stale batch vs newer sheet record -> conflict flagged", groups[0]["conflict"] is True)
+
+
+# ── Case 9/10: own-sent / already-processed messages skipped before any LLM call ──
+def test_skip_before_llm():
+    JOBS_BY_SHEET[None] = []
+
+    def fake_extract(text):
+        raise AssertionError("extract_email_info must not be called for a skipped message")
+
+    def fake_fetch(service, msg_id):
+        if msg_id == "MSG_PROCESSED":
+            raise AssertionError("fetch_message must not be called for an already-processed id")
+        return {
+            "id": msg_id, "thread_id": "t1", "from": "Me <me@example.com>", "to": "",
+            "subject": "Re: thanks", "date_header": "Mon, 1 Jan 2026 10:00:00 +0000",
+            "internal_date_ms": ms_for(2026, 1, 1), "body": "no worries",
+        }
+
+    appmod.extract_email_info = fake_extract
+    gb.build_gmail_service = lambda creds: object()
+    gb.get_own_email_address = lambda service: "me@example.com"
+    gb.load_processed_ids = lambda: {"MSG_PROCESSED"}
+    gb.list_message_ids = lambda service, query: ["MSG_PROCESSED", "MSG_OWN_SENT"]
+    gb.fetch_message = fake_fetch
+
+    result = gb.scan_period(object(), "Jobsearch", date(2026, 1, 1), date(2026, 2, 1))
+    check("already-processed message skipped, never fetched", result["skipped_processed"] == 1)
+    check("own-sent message skipped, LLM never called", result["sent_skipped"] == 1)
+    check("no results produced from skipped messages", result["results"] == [])
+
+
+# ── Case 11: extraction failure doesn't abort the scan ─────────────────────
+def test_extraction_failure_continues_scan():
+    JOBS_BY_SHEET[None] = []
+
+    def fake_fetch(service, msg_id):
+        return {
+            "id": msg_id, "thread_id": "t1", "from": "Recruiter <r@company.com>", "to": "",
+            "subject": f"Subj {msg_id}", "date_header": "Mon, 1 Jan 2026 10:00:00 +0000",
+            "internal_date_ms": ms_for(2026, 1, 1), "body": "body",
+        }
+
+    def fake_extract(text):
+        if "FAIL" in text:
+            raise RuntimeError("both providers failed: simulated")
+        return mk_info("Eta", "Analyst", "Applied", "2026-01-01", confirmation=True)
+
+    appmod.extract_email_info = fake_extract
+    gb.build_gmail_service = lambda creds: object()
+    gb.get_own_email_address = lambda service: ""
+    gb.load_processed_ids = lambda: set()
+    gb.list_message_ids = lambda service, query: ["OK1", "FAIL1", "OK2"]
+    gb.fetch_message = fake_fetch
+
+    progress_events = []
+    result = gb.scan_period(
+        object(), "Jobsearch", date(2026, 1, 1), date(2026, 2, 1),
+        progress_cb=lambda u: progress_events.append(u),
+    )
+    check("scan continues past one failing email", len(result["results"]) == 2)
+    check("failure recorded with extract stage", result["failures"][0]["stage"] == "extract")
+    check("progress callback fires for the start event plus every message", len(progress_events) == 4)
+
+
+# ── Case 13 (structural): scan_period never writes ──────────────────────────
+def test_scan_period_is_read_only():
+    # Require call syntax ("(") so this doesn't false-positive on scan_period's own
+    # docstring, which names these functions in prose to explain why it never calls them.
+    src = inspect.getsource(gb.scan_period)
+    for forbidden in ("update_job_from_email(", "append_job(", "log_processed_email("):
+        check(f"scan_period never calls {forbidden}", forbidden not in src)
+
+
+# ── Rerun-safety at the pure-function level: same input -> same output ─────
+def test_group_results_is_deterministic_across_reruns():
+    JOBS_BY_SHEET[None] = []
+    items = [mk_result("m1", "s", None, None, [], mk_info("Kappa", "Eng", "Applied", "2026-01-01", confirmation=True), ms_for(2026, 1, 1))]
+    g1 = gb.group_results(items)
+    g2 = gb.group_results(items)
+    check("group_results on unchanged input is stable (no hidden re-analysis)", g1[0]["group_key"] == g2[0]["group_key"])
+
+
+# ── Case 14: applying one approved group only touches that group's own emails ──
+def test_apply_only_touches_approved_group():
+    updates, appends, logged = [], [], []
+
+    def fake_update(row_no, status, comments, email_date, sheet_name=None, email_info=None):
+        updates.append((row_no, status))
+        return True, []
+
+    appmod.update_job_from_email = fake_update
+    appmod.append_job = lambda data, sheet_name=None: (appends.append(data), 555)[1]
+    gb.log_processed_email = lambda msg_id, *a, **k: logged.append(msg_id)
+
+    JOBS_BY_SHEET[None] = [{
+        "No.": "30", "Company": "Theta", "Role": "QA", "Status": "Applied",
+        "Contact Person": "", "Company Comments": "", "Date Applied": "2026-01-01",
+    }]
+    matched_items = [
+        mk_result("a1", "s", None, 30, [], mk_info("Theta", "QA", "Applied", "2026-01-01"), ms_for(2026, 1, 1)),
+        mk_result("a2", "s", None, 30, [], mk_info("Theta", "QA", "Interview", "2026-01-10"), ms_for(2026, 1, 10)),
+    ]
+    group_a = gb._build_group("matched", ("row", None, 30), matched_items)
+
+    new_items = [mk_result("b1", "s", None, None, [], mk_info("Iota", "Dev", "Applied", "2026-02-01", confirmation=True), ms_for(2026, 2, 1))]
+    gb._build_group("new", ("new", None, "iota", "dev", "b1"), new_items)  # group B — never applied below
+
+    result = gb.apply_group(group_a, {"comments": {}})
+    check("applying group A succeeds", result["ok"] is True)
+    check("applying group A writes exactly its own 2 rows, in order", updates == [(30, "Applied"), (30, "Interview")])
+    check("applying group A never calls append_job", appends == [])
+    check("applying group A only logs its own message ids", logged == ["a1", "a2"])
+    check("group B's message id is never logged (untouched)", "b1" not in logged)
+
+
+def main():
+    tests = [
+        test_canonical_status_fixes_case_sensitivity,
+        test_single_email_one_group,
+        test_matched_row_timeline_and_role_wording,
+        test_same_company_different_roles_stay_separate,
+        test_confirmation_then_later_rejection_becomes_one_new_group,
+        test_two_separate_confirmations_same_company_role_stay_separate,
+        test_ambiguous_never_merged,
+        test_conflict_protection_kept,
+        test_skip_before_llm,
+        test_extraction_failure_continues_scan,
+        test_scan_period_is_read_only,
+        test_group_results_is_deterministic_across_reruns,
+        test_apply_only_touches_approved_group,
+    ]
+    for t in tests:
+        print(f"--- {t.__name__} ---")
+        t()
+    print()
+    if failures:
+        print(f"{len(failures)} check(s) FAILED:")
+        for f in failures:
+            print(f"  - {f}")
+        sys.exit(1)
+    print(f"All {sum(1 for _ in tests)} test functions passed.")
+
+
+if __name__ == "__main__":
+    main()
