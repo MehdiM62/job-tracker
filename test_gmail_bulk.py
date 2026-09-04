@@ -147,6 +147,82 @@ def test_two_separate_confirmations_same_company_role_stay_separate():
     check("the second confirmation stands alone (no later email yet)", len(by_first.get("m3", {"items": []})["items"]) == 1)
 
 
+# ── Cross-year consolidation ("Playson"): a 2025 confirmation + a 2026 status email
+# for the same normalized company+role must stay ONE group, homed in the 2025 sheet ──
+def test_cross_year_confirmation_and_rejection_consolidate_into_2025():
+    JOBS_BY_SHEET[None] = []
+    confirm = mk_result("m1", "Thanks for applying", "2025", None, [], mk_info("Playson", "Game Developer", "Applied", "2025-12-18", confirmation=True), ms_for(2025, 12, 18))
+    reject = mk_result("m2", "Unfortunately...", None, None, [], mk_info("Playson", "Game Developer", "Rejected", "2026-01-15"), ms_for(2026, 1, 15))
+    groups = gb.group_results([confirm, reject])
+    check("2025 confirmation + 2026 rejection consolidate into one group", len(groups) == 1)
+    g = groups[0] if groups else {}
+    check("the group's home sheet is 2025 (the application's own year), not 2026", g.get("target_sheet") == "2025")
+    check("final proposed status is the latest event (Rejected)", g.get("proposed_status") == "Rejected")
+    check("the timeline has both emails", g.get("email_count") == 2)
+
+
+def test_cross_year_fallback_bounded_to_jan_feb():
+    # A real matching row exists in the 2025 sheet, but the rejection is dated March —
+    # outside the Jan/Feb window — so the fallback must NOT fire; it stays an orphan.
+    JOBS_BY_SHEET[None] = []
+    JOBS_BY_SHEET["2025"] = [{
+        "No.": "77", "Company": "Zorro Inc", "Role": "Analyst", "Status": "Applied",
+        "Contact Person": "", "Company Comments": "", "Date Applied": "2025-11-01",
+    }]
+    reject = mk_result("m1", "Unfortunately...", None, None, [], mk_info("Zorro Inc", "Analyst", "Rejected", "2026-03-10"), ms_for(2026, 3, 10))
+    groups = gb.group_results([reject])
+    check("a March-2026 orphan does NOT fall back to the 2025 sheet (bounded to Jan/Feb)", len(groups) == 1 and groups[0]["kind"] == "single" and groups[0]["matched_row"] is None)
+
+
+def test_jan_feb_2026_fallback_matches_2025_row():
+    JOBS_BY_SHEET[None] = []
+    JOBS_BY_SHEET["2025"] = [{
+        "No.": "88", "Company": "Nordwind AG", "Role": "Backend Engineer", "Status": "Applied",
+        "Contact Person": "", "Company Comments": "", "Date Applied": "2025-11-15",
+    }]
+    reject = mk_result("m1", "Unfortunately...", None, None, [], mk_info("Nordwind AG", "Backend Engineer", "Rejected", "2026-02-05"), ms_for(2026, 2, 5))
+    groups = gb.group_results([reject])
+    check("a Feb-2026 rejection with no 2026 match falls back and matches the 2025 row", len(groups) == 1 and groups[0]["kind"] == "matched")
+    check("the fallback-matched group's target_sheet is 2025", groups[0]["target_sheet"] == "2025")
+    check("the fallback-matched group's matched_row is row 88", str(groups[0]["matched_row"]) == "88")
+
+
+# ── Low-value review-queue filtering ────────────────────────────────────────
+def test_low_value_rejected_to_applied_skipped():
+    JOBS_BY_SHEET[None] = [{
+        "No.": "60", "Company": "Kappa3", "Role": "Ops", "Status": "Rejected",
+        "Contact Person": "", "Company Comments": "", "Date Applied": "2025-05-01",
+    }]
+    r = mk_result("m1", "s", None, 60, [], mk_info("Kappa3", "Ops", "Applied", "2026-01-01"), ms_for(2026, 1, 1))
+    keep, skipped = gb._partition_low_value(gb.group_results([r]))
+    check("Rejected -> Applied is filtered as low-value noise", len(keep) == 0 and len(skipped) == 1)
+
+
+def test_low_value_applied_to_applied_filtered_unless_contact_backfill():
+    JOBS_BY_SHEET[None] = [{
+        "No.": "61", "Company": "Lambda2", "Role": "Support", "Status": "Applied",
+        "Contact Person": "Not specified", "Company Comments": "", "Date Applied": "2025-05-01",
+    }]
+    no_contact = mk_result("m1", "s", None, 61, [], mk_info("Lambda2", "Support", "Applied", "2026-01-01", contact="Not specified"), ms_for(2026, 1, 1))
+    keep1, skipped1 = gb._partition_low_value(gb.group_results([no_contact]))
+    check("Applied -> Applied with nothing new is filtered as low-value", len(keep1) == 0 and len(skipped1) == 1)
+
+    with_contact = mk_result("m2", "s", None, 61, [], mk_info("Lambda2", "Support", "Applied", "2026-01-02", contact="Jane Doe <jane@x.com>"), ms_for(2026, 1, 2))
+    keep2, skipped2 = gb._partition_low_value(gb.group_results([with_contact]))
+    check("Applied -> Applied that backfills a blank contact is kept", len(keep2) == 1 and len(skipped2) == 0)
+
+
+def test_low_value_new_group_with_blank_role_skipped():
+    JOBS_BY_SHEET[None] = []
+    blank_role = mk_result("m1", "s", None, None, [], mk_info("Mu Corp", "", "Applied", "2026-01-01", confirmation=True), ms_for(2026, 1, 1))
+    keep1, skipped1 = gb._partition_low_value(gb.group_results([blank_role]))
+    check("a new application with no identifiable role is filtered as low-value", len(keep1) == 0 and len(skipped1) == 1)
+
+    real_role = mk_result("m2", "s", None, None, [], mk_info("Mu Corp", "Data Analyst", "Applied", "2026-01-01", confirmation=True), ms_for(2026, 1, 1))
+    keep2, skipped2 = gb._partition_low_value(gb.group_results([real_role]))
+    check("a new application with a real role is kept", len(keep2) == 1 and len(skipped2) == 0)
+
+
 # ── Case 7: ambiguous match -> stays its own review item, never silently merged ──
 def test_ambiguous_never_merged():
     JOBS_BY_SHEET[None] = []
@@ -392,6 +468,12 @@ def main():
         test_same_company_different_roles_stay_separate,
         test_confirmation_then_later_rejection_becomes_one_new_group,
         test_two_separate_confirmations_same_company_role_stay_separate,
+        test_cross_year_confirmation_and_rejection_consolidate_into_2025,
+        test_cross_year_fallback_bounded_to_jan_feb,
+        test_jan_feb_2026_fallback_matches_2025_row,
+        test_low_value_rejected_to_applied_skipped,
+        test_low_value_applied_to_applied_filtered_unless_contact_backfill,
+        test_low_value_new_group_with_blank_role_skipped,
         test_ambiguous_never_merged,
         test_conflict_protection_kept,
         test_skip_before_llm,

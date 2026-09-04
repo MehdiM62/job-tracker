@@ -583,7 +583,14 @@ def _pick_best_contact(items: list) -> str:
 def _build_group(kind: str, key: tuple, items: list) -> dict:
     items = _sorted_chrono(items)
     latest = items[-1]
-    target_sheet = latest["target_sheet"]
+    earliest = items[0]
+    # The group's "home" sheet is decided by when the application was actually made
+    # (the earliest item), not by its latest status update. For "matched" groups this
+    # is a no-op — every item in a matched-row group is already resolved within the
+    # same sheet by construction. For a "new" group it's the real fix: a 2025
+    # application with a 2026 rejection used to end up filed under "2026" (the
+    # rejection's own date) instead of staying in "2025" where it belongs.
+    target_sheet = earliest["target_sheet"]
 
     group = {
         "kind": kind,  # "matched" | "new" | "single"
@@ -658,6 +665,14 @@ def _build_group(kind: str, key: tuple, items: list) -> dict:
     return group
 
 
+def _year_month(email_date: str) -> tuple | None:
+    try:
+        d = datetime.strptime((email_date or "").strip(), "%Y-%m-%d")
+    except ValueError:
+        return None
+    return (d.year, d.month)
+
+
 def group_results(results: list) -> list:
     """Groups scanned emails into review items. Identity hierarchy (deterministic, no
     LLM decides this):
@@ -669,21 +684,28 @@ def group_results(results: list) -> list:
        explicitly picks the row. Safety over convenience.
     3. For emails with no row match at all: a "new application confirmation" email
        (is_new_application_confirmation=true, not ambiguous) becomes an ANCHOR, keyed by
-       (target_sheet, normalize_company, normalize_role) — exact string equality, not
-       fuzzy_find_job's substring matching, so e.g. "Engineering Manager" vs "Senior
-       Engineering Manager" never collapse into each other. The SAME key can have
+       (normalize_company, normalize_role) — exact string equality, not fuzzy_find_job's
+       substring matching, so e.g. "Engineering Manager" vs "Senior Engineering
+       Manager" never collapse into each other. NOT keyed by target_sheet — an
+       application made in December 2025 with a rejection dated January 2026 must still
+       consolidate into one group (each email's target_sheet is computed independently
+       from ITS OWN date; the group's actual home sheet is resolved separately in
+       _build_group, from the earliest/anchor item). The SAME normalized key can have
        several anchors (one per confirmation email) — the same person can genuinely
        apply to the same company+role more than once, and each confirmation starts a
        new, separate application group rather than merging into an older one.
     4. Every other no-row-match email (not itself a confirmation) attaches to the most
        RECENT anchor of its own exact key that is dated on or before it — i.e. the
        still-open application as of that email's date. If no anchor qualifies (none
-       exists yet for that key, or every anchor for that key is dated after it), the
-       email stays its own single item for manual review rather than being guessed at.
-       This is what turns a confirmation + a later "unfortunately..." for the same
-       untracked company+role into one proposed new application, while keeping two
-       separate applications to the same company+role (each with its own confirmation)
-       as two distinct groups.
+       exists yet for that key, or every anchor for that key is dated after it):
+       - If it's dated January or February of the year right after the archive year
+         (e.g. Jan/Feb 2026) — a status update this early in the year is often about an
+         application made at the end of the prior year — try ONE more deterministic
+         lookup against the archive sheet's ("2025") own job list. A unique match there
+         reclassifies it as "matched" against that row; ambiguous candidates still go to
+         review (now against the archive sheet); no match leaves it exactly as below.
+       - Otherwise (or if that fallback also finds nothing) it stays its own single item
+         for manual review rather than being guessed at.
     """
     matched: dict = {}
     anchors: dict = {}   # norm key -> list of (anchor_dt, items) — one entry per anchor
@@ -697,9 +719,7 @@ def group_results(results: list) -> list:
         elif r["ambiguous_rows"]:
             review_singles.append(r)
         elif r["info"].get("is_new_application_confirmation"):
-            key = (r["target_sheet"],) + _norm_key(
-                r["info"].get("matched_company", ""), r["info"].get("matched_role", "")
-            )
+            key = _norm_key(r["info"].get("matched_company", ""), r["info"].get("matched_role", ""))
             anchors.setdefault(key, []).append(r)
         else:
             candidates.append(r)
@@ -708,10 +728,11 @@ def group_results(results: list) -> list:
     for key, items in anchors.items():
         anchor_buckets[key] = [(_best_event_dt(it), [it]) for it in sorted(items, key=_best_event_dt)]
 
+    archive_jobs_cache = None  # loaded lazily, at most once, only if the fallback below is actually needed
+    archive_year_plus_one = app.ARCHIVE_SHEET_YEAR + 1
+
     for r in sorted(candidates, key=_best_event_dt):
-        key = (r["target_sheet"],) + _norm_key(
-            r["info"].get("matched_company", ""), r["info"].get("matched_role", "")
-        )
+        key = _norm_key(r["info"].get("matched_company", ""), r["info"].get("matched_role", ""))
         r_dt = _best_event_dt(r)
         best_anchor = None
         for anchor_dt, bucket in anchor_buckets.get(key, []):
@@ -719,8 +740,30 @@ def group_results(results: list) -> list:
                 best_anchor = (anchor_dt, bucket)
         if best_anchor:
             best_anchor[1].append(r)
-        else:
-            review_singles.append(r)
+            continue
+
+        ym = _year_month(r["info"].get("email_date", ""))
+        if ym == (archive_year_plus_one, 1) or ym == (archive_year_plus_one, 2):
+            if archive_jobs_cache is None:
+                try:
+                    archive_jobs_cache = app.get_all_jobs(app.get_worksheet(app.ARCHIVE_SHEET_NAME))
+                except Exception:
+                    archive_jobs_cache = []
+            archive_row, archive_ambiguous = app.fuzzy_find_job(
+                r["info"].get("matched_company", ""), r["info"].get("matched_role", ""),
+                archive_jobs_cache, email_date=r["info"].get("email_date", ""),
+            )
+            if archive_row is not None or archive_ambiguous:
+                r["target_sheet"] = app.ARCHIVE_SHEET_NAME
+                r["matched_row"] = archive_row
+                r["ambiguous_rows"] = archive_ambiguous
+                if archive_row is not None:
+                    matched.setdefault(("row", app.ARCHIVE_SHEET_NAME, archive_row), []).append(r)
+                else:
+                    review_singles.append(r)
+                continue
+
+        review_singles.append(r)
 
     groups = [_build_group("matched", k, v) for k, v in matched.items()]
     for key, bucket_list in anchor_buckets.items():
@@ -732,6 +775,41 @@ def group_results(results: list) -> list:
             groups.append(_build_group("new", group_key, items))
     groups += [_build_group("single", ("single", r["message_id"]), [r]) for r in review_singles]
     return groups
+
+
+def _is_low_value(g: dict) -> bool:
+    """Post-grouping noise filter — a group that's technically valid but not worth a
+    human's attention, per explicit product decisions:
+
+    - Rejected -> Applied never makes sense as a proposed transition. Most often it's
+      really a fresh/duplicate application that fuzzy_find_job matched to an old
+      already-rejected row (matching doesn't consider status) rather than a genuinely
+      new application — surfacing it as "here's a status to fix" is actively
+      misleading, so it's skipped rather than shown. Not auto-reclassified as a new
+      application here — that would mean changing fuzzy_find_job itself.
+    - Applied -> Applied (no status change, no sheet-vs-batch conflict) adds nothing
+      UNLESS it would backfill a currently-blank contact — otherwise it's just another
+      confirmation/ack email for an application already correctly tracked.
+    - A brand-new application with no identifiable role isn't worth a bare row with
+      nothing to search or filter on.
+    """
+    if g["kind"] == "matched":
+        if g["current_status"] == "Rejected" and g["proposed_status"] == "Applied":
+            return True
+        if g["current_status"] == "Applied" and g["proposed_status"] == "Applied" and not g["conflict"]:
+            contact_backfill = app._is_blank_field(g["current_contact"]) and not app._is_blank_field(g["proposed_contact"])
+            if not contact_backfill:
+                return True
+    if g["kind"] == "new" and not (g["role"] or "").strip():
+        return True
+    return False
+
+
+def _partition_low_value(groups: list) -> tuple:
+    keep, skipped = [], []
+    for g in groups:
+        (skipped if _is_low_value(g) else keep).append(g)
+    return keep, skipped
 
 
 # ── Apply (the only writes in this module) ───────────────────────────────────
@@ -1034,7 +1112,7 @@ def _render_scan_controls() -> None:
     st.markdown("  \n".join(lines))
 
     def _finalize(cancelled: bool) -> None:
-        groups = group_results(runtime["results"])
+        groups, low_value_skipped = _partition_low_value(group_results(runtime["results"]))
         elapsed = time.monotonic() - runtime["start_time"]
         providers = st.session_state.get("llm_providers_used", [])
         st.session_state["bulk_groups"] = groups
@@ -1049,6 +1127,7 @@ def _render_scan_controls() -> None:
             "openrouter_successes": providers.count("openrouter"),
             "groq_successes": providers.count("groq"),
             "groups": len(groups),
+            "low_value_skipped": len(low_value_skipped),
             "high": sum(1 for g in groups if g["bucket"] == "high"),
             "review": sum(1 for g in groups if g["bucket"] == "review"),
             "unmatched": sum(1 for g in groups if g["bucket"] == "unmatched"),
@@ -1107,7 +1186,9 @@ def _render_scan_summary() -> None:
         f"{s.get('extraction_failures', s['failed'])} extraction failures.\n\n"
         f"**{s.get('groups', s['high'] + s['review'] + s['unmatched'])} application group(s)** — "
         f"🟢 {s['high']} high confidence · 🟡 {s['review']} need review (incl. ambiguous) · "
-        f"🆕 {s['unmatched']} unmatched/new.\n\n"
+        f"🆕 {s['unmatched']} unmatched/new"
+        + (f" · 🙈 {s['low_value_skipped']} skipped as low-value" if s.get("low_value_skipped") else "")
+        + ".\n\n"
         f"LLM: {s.get('openrouter_successes', 0)} OpenRouter · {s.get('groq_successes', 0)} Groq fallback · "
         f"{s.get('llm_retries', 0)} retry/recovery — elapsed {_format_hms(s.get('elapsed_seconds', 0))}."
     )

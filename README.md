@@ -409,7 +409,16 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   anchors them — a later status update for the same company+role joins that group, but
   two genuinely separate applications to the same company+role (each with its own
   confirmation) stay as two groups. Anything uncertain stays its own item for you to
-  review rather than being merged automatically.
+  review rather than being merged automatically. This consolidation works across a
+  year boundary too — an application made in December that gets a status update the
+  following January or February still consolidates into one group, homed in the
+  correct archive sheet, instead of splitting across two years.
+- **Low-value proposals are filtered out of the review queue**: a proposed status
+  regression from Rejected back to Applied, a redundant Applied→Applied update with
+  nothing new to add (unless it would fill in a currently-blank contact), and a
+  brand-new application with no identifiable role are all skipped rather than shown —
+  none of them are written anywhere, and a later re-scan surfaces them the same way,
+  so nothing is lost, just decluttered.
 - **Final proposed status is whichever event is chronologically latest** in a group's
   timeline — not a fixed hierarchy (e.g. Applied → Interview → Rejected proposes
   Rejected; Applied → Interview → Assessment proposes Assessment). The existing
