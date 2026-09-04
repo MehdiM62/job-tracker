@@ -105,15 +105,18 @@ stumbled-upon URL."
   or Streamlit Secrets when deployed (see below). There is no default — if
   `APP_PASSWORD` isn't set, the app shows a configuration error and refuses to run
   rather than falling back to anything.
-- **The password is never in the URL, a cookie, or localStorage.** It's compared with
-  `hmac.compare_digest()` and, once correct, kept only in
-  `st.session_state["authenticated"]` for the current Streamlit session. There's
-  nothing to bookmark or share by URL.
-- **You'll be asked again** after the browser/tab's session ends, after the Streamlit
-  process restarts, or after a redeploy. That's the intended tradeoff for a
-  single-user personal tool — simple and safe rather than persistent and clever.
-- **Logout**: a small **🚪 Logout** button in the sidebar clears the session and
-  returns you to the login screen.
+- **The password itself is never in the URL, a cookie, or localStorage.** It's
+  compared with `hmac.compare_digest()` and only ever kept in
+  `st.session_state["authenticated"]` for the current Streamlit session.
+- **You stay logged in until you explicitly log out.** A successful login issues a
+  long random session token (not the password) that's carried in the URL (`?s=...`)
+  and checked against a persisted allow-list (a hidden worksheet tab, so it survives
+  redeploys, not just the current server process). This is what keeps you logged in
+  across a lost/idle browser session, a backgrounded tab, or an app reboot — all of
+  which previously meant a fresh login and losing any unsaved bulk-review state. The
+  token expires on its own after 30 days regardless.
+- **Logout**: the **🚪 Logout** button in the sidebar revokes the token everywhere
+  (not just this tab), clears the session, and returns you to the login screen.
 
 ---
 

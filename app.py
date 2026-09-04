@@ -5,12 +5,13 @@ from groq import Groq
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import hmac
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from dotenv import load_dotenv
@@ -1029,15 +1030,134 @@ def _restore_fetch_snapshot_if_needed() -> None:
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-# Single-user password gate. Authentication lives only in st.session_state for the
-# current Streamlit session — never in the URL, a cookie, or localStorage — so it's
-# gone on a fresh browser session, page reload after the server restarts, or a new
-# deploy. That's intentional: this app now holds Sheets + a persisted Gmail OAuth
-# refresh token, so a password that leaks by simply being visible in a shared/bookmarked
-# URL is no longer an acceptable tradeoff for the convenience of staying "logged in".
+# Single-user password gate. Login now persists across a lost Streamlit session (idle
+# timeout, browser left unattended, an app reboot from a redeploy — all previously
+# meant landing back on the password prompt and, worse, losing whatever unsaved bulk-
+# review state was in memory) via a long random SESSION TOKEN — never the password
+# itself — carried in the URL (?s=...) and checked against a persisted allow-list (a
+# hidden worksheet tab, same pattern as the Gmail OAuth refresh token, so it survives
+# redeploys too). Logging out deletes the token everywhere; it also expires on its own
+# after SESSION_TOKEN_TTL_DAYS.
+#
+# This intentionally puts something auth-relevant back in the URL, which earlier work
+# on this app explicitly moved away from — worth being precise about why this is a
+# different situation. The prior incident was the password itself living in the query
+# string and directly conflicting with the Gmail OAuth redirect (Google's own callback
+# reuses ?code=&state=..., and the two mechanisms fighting over the query string broke
+# login). This token: (a) is never the password — it's a 256-bit random value that's
+# useless without the server-side allow-list entry, expires on its own, and a leaked
+# one can be revoked by just logging out; (b) uses its own query key ("s") that
+# handle_oauth_callback() below never touches (it only ever pops code/state/scope/iss);
+# (c) is explicitly restored to the URL by _ensure_session_token_in_url() after any
+# navigation that can't carry it forward on its own — Google's redirect lands back on
+# the bare configured redirect_uri, which by definition can't include params from the
+# page the user was on before leaving for Google's consent screen — so a session that
+# survives that round trip (the common case) never ends up silently logged out client-
+# side while still holding a valid, unused token server-side.
+
+SESSION_TOKEN_SHEET_NAME = "_app_sessions"
+SESSION_TOKEN_HEADER = ["token", "expires_at"]
+SESSION_TOKEN_TTL_DAYS = 30
+SESSION_QUERY_PARAM = "s"
+
+
+def _session_store_ws():
+    base_ws = get_worksheet()  # any worksheet, just to get a handle on the spreadsheet
+    sh = base_ws.spreadsheet
+    try:
+        return sh.worksheet(SESSION_TOKEN_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SESSION_TOKEN_SHEET_NAME, rows=200, cols=2)
+        ws.update([SESSION_TOKEN_HEADER], "A1")
+        sh.batch_update({
+            "requests": [{
+                "updateSheetProperties": {
+                    "properties": {"sheetId": ws.id, "hidden": True},
+                    "fields": "hidden",
+                }
+            }]
+        })
+        return ws
+
+
+def _load_valid_session_tokens() -> dict:
+    """token -> expires_at (naive datetime, CET-local — matches the convention already
+    used for the Gmail token's own timestamp elsewhere in this app)."""
+    try:
+        values = _session_store_ws().get_all_values()
+    except Exception:
+        return {}
+    tokens = {}
+    for row in values[1:]:
+        if not row or not row[0].strip():
+            continue
+        try:
+            tokens[row[0].strip()] = datetime.strptime(row[1], "%Y-%m-%d %H:%M")
+        except (IndexError, ValueError):
+            continue
+    return tokens
+
+
+def _issue_session_token() -> str:
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(CET).replace(tzinfo=None)
+    expires = now + timedelta(days=SESSION_TOKEN_TTL_DAYS)
+    try:
+        ws = _session_store_ws()
+        values = ws.get_all_values()
+        # Best-effort prune of already-expired rows while we're here, so the sheet
+        # doesn't grow unbounded — never blocks issuing the new token if this fails.
+        for i in range(len(values), 1, -1):
+            row = values[i - 1]
+            if not row or not row[0].strip():
+                continue
+            try:
+                if datetime.strptime(row[1], "%Y-%m-%d %H:%M") < now:
+                    ws.delete_rows(i)
+            except (IndexError, ValueError):
+                continue
+        ws.append_row([token, expires.strftime("%Y-%m-%d %H:%M")], value_input_option="RAW")
+    except Exception:
+        pass  # persistence is best-effort — st.session_state still keeps this browser tab logged in for the rest of its own session even if this fails
+    return token
+
+
+def _revoke_session_token(token: str) -> None:
+    try:
+        ws = _session_store_ws()
+        values = ws.get_all_values()
+        for i, row in enumerate(values[1:], start=2):
+            if row and row[0].strip() == token:
+                ws.delete_rows(i)
+                return
+    except Exception:
+        pass
+
 
 def is_authenticated() -> bool:
-    return bool(st.session_state.get("authenticated"))
+    if st.session_state.get("authenticated"):
+        return True
+    token = st.query_params.get(SESSION_QUERY_PARAM)
+    if token:
+        expires = _load_valid_session_tokens().get(token)
+        if expires and expires > datetime.now(CET).replace(tzinfo=None):
+            st.session_state["authenticated"] = True
+            st.session_state["session_token"] = token
+            return True
+    return False
+
+
+def _ensure_session_token_in_url() -> None:
+    """Called once per run, only after is_authenticated() already passed. Restores
+    ?s=... whenever this session's own remembered token isn't already reflected in the
+    URL — see the module comment above for exactly which navigation strips it and why
+    this is safe with respect to the Gmail OAuth callback."""
+    token = st.session_state.get("session_token")
+    if not token:
+        token = _issue_session_token()
+        st.session_state["session_token"] = token
+    if st.query_params.get(SESSION_QUERY_PARAM) != token:
+        st.query_params[SESSION_QUERY_PARAM] = token
 
 
 def login_gate() -> None:
@@ -1058,6 +1178,7 @@ def login_gate() -> None:
     if submitted:
         if hmac.compare_digest(pw, app_password):
             st.session_state["authenticated"] = True
+            st.session_state["session_token"] = _issue_session_token()
             st.rerun()
         else:
             st.error("Incorrect password.")
@@ -1065,7 +1186,12 @@ def login_gate() -> None:
 
 def logout_button() -> None:
     if st.session_state.get("authenticated") and st.sidebar.button("🚪 Logout"):
+        token = st.session_state.get("session_token")
+        if token:
+            _revoke_session_token(token)
         st.session_state["authenticated"] = False
+        st.session_state.pop("session_token", None)
+        st.query_params.pop(SESSION_QUERY_PARAM, None)
         st.rerun()
 
 
@@ -1078,6 +1204,7 @@ def main():
         login_gate()
         st.stop()
 
+    _ensure_session_token_in_url()
     logout_button()
 
     # Processes Google's OAuth redirect (?code=...) if present — no-ops instantly on

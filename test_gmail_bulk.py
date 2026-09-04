@@ -511,6 +511,46 @@ def test_already_applied_messages_are_skipped_on_retry():
     check("an already-logged new-application group is skipped entirely, no duplicate row", result2.get("already_applied") is True and appends == [])
 
 
+# ── Persistent login: session token issue/validate/expire/revoke round-trip ────
+class _FakeSessionSheet:
+    """Minimal in-memory stand-in for the hidden _app_sessions worksheet — just enough
+    of the gspread Worksheet API (get_all_values/append_row/delete_rows) for
+    _session_store_ws()'s callers to exercise the real persistence logic end-to-end."""
+
+    def __init__(self):
+        self.rows = [["token", "expires_at"]]
+
+    def get_all_values(self):
+        return [list(r) for r in self.rows]
+
+    def append_row(self, row, value_input_option=None):
+        self.rows.append(list(row))
+
+    def delete_rows(self, row_index):
+        del self.rows[row_index - 1]
+
+
+def test_session_token_issue_validate_expire_revoke():
+    fake = _FakeSessionSheet()
+    appmod._session_store_ws = lambda: fake
+
+    token = appmod._issue_session_token()
+    check("issuing a token adds exactly one row", len(fake.rows) == 2)
+    tokens = appmod._load_valid_session_tokens()
+    check("the issued token loads back with a future expiry", token in tokens and tokens[token] > datetime.now())
+
+    appmod._revoke_session_token(token)
+    check("revoking removes the row", len(fake.rows) == 1)
+    check("a revoked token no longer loads", token not in appmod._load_valid_session_tokens())
+
+    # An already-expired row must not be treated as valid, and issuing a new token
+    # should prune it (best-effort cleanup) rather than let the sheet grow forever.
+    fake.rows.append(["stale-token", "2020-01-01 00:00"])
+    appmod._issue_session_token()
+    remaining = [r[0] for r in fake.rows[1:]]
+    check("issuing a new token prunes already-expired rows", "stale-token" not in remaining)
+
+
 def main():
     tests = [
         test_canonical_status_fixes_case_sensitivity,
@@ -539,6 +579,7 @@ def main():
         test_apply_only_touches_approved_group,
         test_log_failure_does_not_fail_group,
         test_already_applied_messages_are_skipped_on_retry,
+        test_session_token_issue_validate_expire_revoke,
     ]
     for t in tests:
         print(f"--- {t.__name__} ---")
