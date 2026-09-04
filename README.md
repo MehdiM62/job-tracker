@@ -423,6 +423,10 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   broken response — an invalid status, or a comment that degenerates into repeated "…"
   filler instead of real text — and the extraction is retried once automatically rather
   than proposing nonsense for you to review.
+- **A hung AI request can't freeze the scan indefinitely**: both providers are given a
+  45-second request timeout. Without one, a stuck request could block a scan (and the
+  Cancel button, which can only be acted on between messages) for as long as the
+  provider SDK's own default — up to 10 minutes for a single request.
 - **Final proposed status is whichever event is chronologically latest** in a group's
   timeline — not a fixed hierarchy (e.g. Applied → Interview → Rejected proposes
   Rejected; Applied → Interview → Assessment proposes Assessment). The existing

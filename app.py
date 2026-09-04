@@ -176,6 +176,14 @@ def _get_secret(name: str) -> str:
 OPENROUTER_MODEL = "openai/gpt-oss-120b"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GROQ_MODEL = "openai/gpt-oss-120b"
+# Neither SDK sets a request timeout by default (the openai client's default is 10
+# minutes) — a single hung provider request used to freeze a bulk scan indefinitely
+# with no way to recover: the scan loop is one synchronous call per Streamlit rerun, so
+# a stuck network call blocks the whole script, and Cancel can't be acted on either
+# (Streamlit can only respond to a widget click between reruns, not mid-call). Failing
+# fast here lets the existing retry/fallback/one-bad-email-never-aborts-the-batch logic
+# actually do its job instead of the UI just appearing frozen.
+LLM_REQUEST_TIMEOUT_SECONDS = 45
 
 
 def _redact(text: str, *secrets: str) -> str:
@@ -190,7 +198,7 @@ def _call_openrouter(prompt: str) -> dict:
     if not api_key:
         raise RuntimeError("OpenRouter not configured (OPENROUTER_API_KEY missing)")
 
-    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
     try:
         response = client.chat.completions.create(
             model=OPENROUTER_MODEL,
@@ -224,7 +232,7 @@ def _call_groq(prompt: str) -> dict:
     if not api_key:
         raise RuntimeError("Groq not configured (GROQ_API_KEY missing)")
 
-    client = Groq(api_key=api_key)
+    client = Groq(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
     try:
         response = client.chat.completions.create(
             model=GROQ_MODEL,
