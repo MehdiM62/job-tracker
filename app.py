@@ -949,7 +949,20 @@ def append_job(data: dict, sheet_name: str | None = None) -> int:
             if data_rows[i] and data_rows[i][0].strip().isdigit()
         ]
         if bumped:
-            _with_sheets_retry(ws.update, bumped, renumber_range, value_input_option="RAW")
+            try:
+                _with_sheets_retry(ws.update, bumped, renumber_range, value_input_option="RAW")
+            except Exception:
+                # The new row itself is already safely inserted with the correct data
+                # and its own correct new_no — only the OTHER rows pushed down by it
+                # didn't get their numbers bumped. Confirmed live via the Email Import
+                # Log: this exception propagating used to make the caller think the
+                # entire operation failed, when the actual application data had
+                # already been written — the message never got logged as processed,
+                # and the row was still there (with no way to tell it apart from a
+                # genuine failure) if the same email got processed again. A stale
+                # number is a cosmetic issue fixable with a later renumber pass; losing
+                # track of whether this email was already applied is a worse one.
+                pass
 
     try:
         format_row(ws, sheet_row, [data["key_skills"], data["comments"], data.get("missing_skills", "")])

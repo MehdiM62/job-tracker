@@ -28,6 +28,11 @@ def _load_app_module():
 
 
 appmod = _load_app_module()
+# Captured before any test stubs appmod.append_job/get_worksheet (several do, to avoid
+# hitting real Sheets — none restore it afterward, since most tests never need the real
+# implementation again). Anything that needs to exercise append_job's actual logic
+# later must call this reference directly, not appmod.append_job.
+_REAL_APPEND_JOB = appmod.append_job
 
 import gmail_bulk as gb  # noqa: E402
 
@@ -665,6 +670,69 @@ def test_insert_row_with_values_recovers_when_populate_step_fails_first():
     check("the values land in the exact row that was opened", ws.written[1] == "A5:D5")
 
 
+# ── Real incident: append_job()'s renumbering step failing after the row itself was
+# already correctly inserted used to make the whole call raise — the caller then never
+# logged the message as processed, even though its data was safely written, risking it
+# being processed again later. Confirms the row is still written and append_job()
+# still returns normally when only the renumber step fails. ──
+class _FakeAppendJobWorksheet:
+    HEADER = ["No.", "Date Applied", "Company", "Role", "City", "Language Req.",
+              "Key Skills Required", "Contact Person", "Job URL", "Status", "Comments",
+              "CV Language", "Source", "Company Comments", "Match Level", "Missing Skills"]
+
+    def __init__(self, existing_rows, fail_renumber=False):
+        self.rows = [list(r) for r in existing_rows]
+        self.fail_renumber = fail_renumber
+        self.id = 123
+        self.spreadsheet = self
+        self.inserted = None
+        self.renumber_attempted = False
+
+    def row_values(self, n):
+        return self.HEADER if n == 1 else self.rows[n - 2]
+
+    def get_all_values(self):
+        return [self.HEADER] + self.rows
+
+    def batch_update(self, body):
+        return {"ok": True}  # covers both _insert_row_with_values step 1 and format_row's dimension resize
+
+    def update(self, values, range_name, value_input_option=None):
+        if ":A" in range_name:  # the renumber call always targets a single column-A range
+            self.renumber_attempted = True
+            if self.fail_renumber:
+                raise _fake_api_error(429)
+            return {"ok": True}
+        self.inserted = (values, range_name)  # the _insert_row_with_values populate step
+        return {"ok": True}
+
+    def append_row(self, values, value_input_option=None):
+        self.rows.append(values)
+
+    def batch_format(self, *a, **k):
+        return {"ok": True}
+
+
+def test_append_job_survives_a_renumber_failure():
+    real_sleep = appmod.time.sleep
+    appmod.time.sleep = lambda s: None
+    try:
+        existing = [["1", "2026-01-01 00:00", "ExistingCo", "Role", "", "", "", "", "", "Applied", "", "EN", "Other", "", "", ""]]
+        fake = _FakeAppendJobWorksheet(existing, fail_renumber=True)
+        appmod.get_worksheet = lambda sheet_name=None: fake
+        data = {
+            "company": "NewCo", "role": "NewRole", "city": "", "language_req": "", "key_skills": "",
+            "contact_person": "", "url": "", "status": "Applied", "comments": "", "cv_lang": "EN",
+            "source": "Other", "match_level": "", "missing_skills": "", "date_applied": "2025-12-01 00:00",
+        }
+        new_no = _REAL_APPEND_JOB(data)
+    finally:
+        appmod.time.sleep = real_sleep
+    check("append_job does not raise when only the renumber step fails", new_no == 1)
+    check("the renumber step was actually attempted (not silently skipped)", fake.renumber_attempted)
+    check("the new row's own data was still written despite the renumber failure", fake.inserted is not None)
+
+
 def main():
     tests = [
         test_canonical_status_fixes_case_sensitivity,
@@ -699,6 +767,7 @@ def main():
         test_session_token_issue_validate_expire_revoke,
         test_with_sheets_retry_recovers_from_transient_errors_and_gives_up_on_others,
         test_insert_row_with_values_recovers_when_populate_step_fails_first,
+        test_append_job_survives_a_renumber_failure,
     ]
     for t in tests:
         print(f"--- {t.__name__} ---")
