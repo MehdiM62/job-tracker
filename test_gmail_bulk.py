@@ -589,6 +589,82 @@ def test_session_token_issue_validate_expire_revoke():
     check("issuing a new token prunes already-expired rows", "stale-token" not in remaining)
 
 
+# ── Write-path resilience: a real incident left permanently blank rows because
+# gspread's insert_row() does two separate API calls internally (open a blank row,
+# then populate it) and a 429 on the second one after the first succeeded lost the
+# values for good. Verify the reimplementation actually recovers. ──
+import gspread as _gspread_for_tests  # noqa: E402
+
+
+class _FakeResponse:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+    def json(self):
+        return {"error": {"code": self.status_code, "message": "simulated", "status": "RESOURCE_EXHAUSTED"}}
+
+
+def _fake_api_error(status_code):
+    return _gspread_for_tests.exceptions.APIError(_FakeResponse(status_code))
+
+
+def test_with_sheets_retry_recovers_from_transient_errors_and_gives_up_on_others():
+    calls = {"n": 0}
+
+    def flaky_then_ok():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _fake_api_error(429)
+        return "ok"
+
+    result = appmod._with_sheets_retry(flaky_then_ok, max_attempts=5, base_delay=0.001)
+    check("transient 429s are retried until success", result == "ok" and calls["n"] == 3)
+
+    def always_permission_denied():
+        raise _fake_api_error(403)
+
+    raised = False
+    try:
+        appmod._with_sheets_retry(always_permission_denied, max_attempts=3)
+    except _gspread_for_tests.exceptions.APIError:
+        raised = True
+    check("a non-retryable error (403) is not retried away, it propagates", raised)
+
+
+class _FakeInsertWorksheet:
+    """Simulates gspread's real insert_row() behavior: opening the row and writing its
+    values are two separate calls. fail_step2_times controls how many times the second
+    call rejects before succeeding, to prove the row ends up populated, not blank."""
+
+    def __init__(self, fail_step2_times=0):
+        self.fail_step2_times = fail_step2_times
+        self.id = 999
+        self.written = None
+        self.spreadsheet = self
+
+    def batch_update(self, body):
+        return {"ok": True}  # step 1: opening the row always succeeds in this test
+
+    def update(self, values, range_name, value_input_option=None):
+        if self.fail_step2_times > 0:
+            self.fail_step2_times -= 1
+            raise _fake_api_error(429)
+        self.written = (values, range_name)
+        return {"ok": True}
+
+
+def test_insert_row_with_values_recovers_when_populate_step_fails_first():
+    real_sleep = appmod.time.sleep
+    appmod.time.sleep = lambda s: None  # skip the real backoff delay for this test
+    try:
+        ws = _FakeInsertWorksheet(fail_step2_times=2)
+        appmod._insert_row_with_values(ws, ["1", "2026-01-01 00:00", "Acme", "Role"], 5)
+    finally:
+        appmod.time.sleep = real_sleep
+    check("the row is populated once the retried populate step finally succeeds", ws.written is not None)
+    check("the values land in the exact row that was opened", ws.written[1] == "A5:D5")
+
+
 def main():
     tests = [
         test_canonical_status_fixes_case_sensitivity,
@@ -621,6 +697,8 @@ def main():
         test_log_failure_does_not_fail_group,
         test_already_applied_messages_are_skipped_on_retry,
         test_session_token_issue_validate_expire_revoke,
+        test_with_sheets_retry_recovers_from_transient_errors_and_gives_up_on_others,
+        test_insert_row_with_values_recovers_when_populate_step_fails_first,
     ]
     for t in tests:
         print(f"--- {t.__name__} ---")

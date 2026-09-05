@@ -662,6 +662,57 @@ def get_worksheet(sheet_name: str | None = None):
     return _resolve_worksheet(sheet_name)
 
 
+def _with_sheets_retry(fn, *args, max_attempts=5, base_delay=1.0, **kwargs):
+    """Retries a SINGLE Sheets-API call with exponential backoff on a rate-limit/
+    transient error (429/500/503). Deliberately applied to individual, idempotent
+    calls only — never to a whole multi-step function like append_job() or
+    update_job_from_email() as one unit. A real incident showed why: gspread's own
+    insert_row() does TWO separate API requests internally (open a blank row, then
+    populate it) — a 429 on the second one after the first already succeeded left
+    permanently blank rows in the sheet, and retrying the WHOLE function afterward
+    (whether automatically or by the user re-approving and re-applying) opened ANOTHER
+    row on top of that. Retrying each individual write in place is what actually fixes
+    this: a rejected request means nothing happened yet (safe to just try again), and
+    re-running an idempotent single-cell/range update if it fails has no bad effect —
+    it either completes what a prior attempt started or is a harmless no-op repeat."""
+    delay = base_delay
+    for attempt in range(max_attempts):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in (429, 500, 503) or attempt == max_attempts - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
+def _insert_row_with_values(ws, row_values: list, sheet_row: int) -> None:
+    """Reimplements gspread's insert_row(..., inherit_from_before=True) as two
+    explicit, separately-retried steps instead of trusting it as one black-box call —
+    see _with_sheets_retry's docstring for exactly why. Step 1 opens the blank row
+    (safe to retry: a rejection means it didn't happen). Step 2 writes the actual
+    values into that exact row via a plain, idempotent range update — retried more
+    aggressively, since once the row exists, populating it must not be allowed to
+    silently give up and leave it blank."""
+    _with_sheets_retry(ws.spreadsheet.batch_update, {
+        "requests": [{
+            "insertDimension": {
+                "range": {
+                    "sheetId": ws.id, "dimension": "ROWS",
+                    "startIndex": sheet_row - 1, "endIndex": sheet_row,
+                },
+                "inheritFromBefore": True,
+            }
+        }]
+    })
+    end_col = chr(ord("A") + len(row_values) - 1)
+    _with_sheets_retry(
+        ws.update, [row_values], f"A{sheet_row}:{end_col}{sheet_row}",
+        value_input_option="USER_ENTERED", max_attempts=6,
+    )
+
+
 EXTRA_COLS = ["Company Comments", "Match Level", "Missing Skills"]
 
 def ensure_extra_cols(ws) -> dict:
@@ -675,7 +726,7 @@ def ensure_extra_cols(ws) -> dict:
         if name in header:
             indices[name] = header.index(name) + 1
         else:
-            ws.update_cell(1, next_col, name)
+            _with_sheets_retry(ws.update_cell, 1, next_col, name)
             indices[name] = next_col
             next_col += 1
             header.append(name)  # keep header in sync for subsequent lookups
@@ -708,7 +759,7 @@ def format_row(ws, row_num: int, bullet_texts: list) -> None:
     single line (long ones get cut off, not wrapped) with top alignment. Row height
     is sized to the tallest cell's bullet count, capped at ROW_MAX_LINES so a long
     history doesn't balloon the row — it takes exactly the space it needs, no more."""
-    ws.batch_format([
+    _with_sheets_retry(ws.batch_format, [
         {
             "range": f"B{row_num}",
             "format": {
@@ -723,7 +774,7 @@ def format_row(ws, row_num: int, bullet_texts: list) -> None:
     ])
     max_lines = max([t.count("\n") + 1 for t in bullet_texts if t and t.strip()], default=1)
     height = ROW_BASE_PX + min(max_lines, ROW_MAX_LINES) * ROW_LINE_PX
-    ws.spreadsheet.batch_update({
+    _with_sheets_retry(ws.spreadsheet.batch_update, {
         "requests": [{
             "updateDimensionProperties": {
                 "range": {
@@ -877,9 +928,13 @@ def append_job(data: dict, sheet_name: str | None = None) -> int:
     ]
 
     if insert_idx == total_existing:
-        ws.append_row(row_values, value_input_option="USER_ENTERED")
+        # A single atomic API call (values.append) — no partial-failure risk, safe to
+        # retry as one unit if it's ever rejected outright.
+        _with_sheets_retry(ws.append_row, row_values, value_input_option="USER_ENTERED")
     else:
-        ws.insert_row(row_values, sheet_row, value_input_option="USER_ENTERED", inherit_from_before=True)
+        # NOT ws.insert_row() — see _insert_row_with_values's docstring for the real
+        # incident (permanently blank rows) that came from trusting it as one call.
+        _insert_row_with_values(ws, row_values, sheet_row)
         renumber_range = f"A{sheet_row + 1}:A{sheet_row + (total_existing - insert_idx)}"
         # Bumped values come from data_rows — the SAME read taken at the top of this
         # call, before this insert — rather than re-reading the range after the insert.
@@ -894,9 +949,16 @@ def append_job(data: dict, sheet_name: str | None = None) -> int:
             if data_rows[i] and data_rows[i][0].strip().isdigit()
         ]
         if bumped:
-            ws.update(bumped, renumber_range, value_input_option="RAW")
+            _with_sheets_retry(ws.update, bumped, renumber_range, value_input_option="RAW")
 
-    format_row(ws, sheet_row, [data["key_skills"], data["comments"], data.get("missing_skills", "")])
+    try:
+        format_row(ws, sheet_row, [data["key_skills"], data["comments"], data.get("missing_skills", "")])
+    except Exception:
+        # Formatting is cosmetic — the row's actual data is already safely written
+        # above. Letting a formatting hiccup fail this whole call would report a
+        # successful write as "failed", which is exactly what pushed a user to
+        # manually retry and create a genuine duplicate row in a real incident.
+        pass
     return new_no
 
 
@@ -949,7 +1011,7 @@ def update_job_from_email(
     for i, row in enumerate(all_values[1:], start=2):
         if row and str(row[0]).strip() == str(row_no):
             old_status = row[status_col - 1] if len(row) >= status_col else ""
-            ws.update_cell(i, status_col, new_status)
+            _with_sheets_retry(ws.update_cell, i, status_col, new_status)
 
             date_str = email_date.strip() if email_date and email_date.strip() else datetime.now(CET).strftime("%Y-%m-%d")
             status_line = (
@@ -961,7 +1023,7 @@ def update_job_from_email(
 
             existing = row[cc_col - 1] if len(row) >= cc_col else ""
             combined = (existing.strip() + "\n\n---\n\n" + entry).strip() if existing.strip() else entry
-            ws.update_cell(i, cc_col, combined)
+            _with_sheets_retry(ws.update_cell, i, cc_col, combined)
 
             filled = []
             for col_name, info_key in BACKFILL_FIELDS:
@@ -969,12 +1031,15 @@ def update_job_from_email(
                 current = row[col_idx - 1] if len(row) >= col_idx else ""
                 new_value = str(email_info.get(info_key) or "").strip()
                 if _is_blank_field(current) and new_value and not _is_blank_field(new_value):
-                    ws.update_cell(i, col_idx, new_value)
+                    _with_sheets_retry(ws.update_cell, i, col_idx, new_value)
                     filled.append(col_name)
 
             skills = row[skills_col - 1] if len(row) >= skills_col else ""
             missing = row[missing_col - 1] if len(row) >= missing_col else ""
-            format_row(ws, i, [skills, combined, missing])
+            try:
+                format_row(ws, i, [skills, combined, missing])
+            except Exception:
+                pass  # cosmetic only — the status/comment update above already succeeded
             return True, filled
     return False, []
 
