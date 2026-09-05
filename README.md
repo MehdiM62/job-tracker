@@ -415,7 +415,11 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   review rather than being merged automatically. This consolidation works across a
   year boundary too — an application made in December that gets a status update the
   following January or February still consolidates into one group, homed in the
-  correct archive sheet, instead of splitting across two years.
+  correct archive sheet, instead of splitting across two years. Two confirmation-
+  shaped emails for the same company+role within a few days of each other (an auto-ack
+  plus a separate "thank you" notice, say) are also treated as one application rather
+  than each starting its own — genuine repeat applications are weeks or months apart
+  in practice, never days.
 - **Low-value proposals are filtered out of the review queue**: a proposed status
   regression from Rejected back to Applied, a redundant Applied→Applied update with
   nothing new to add (unless it would fill in a currently-blank contact), and a

@@ -673,6 +673,32 @@ def _year_month(email_date: str) -> tuple | None:
     return (d.year, d.month)
 
 
+# A real duplicate-row incident: two "new application confirmation" emails for the
+# same normalized company+role, 4 minutes and separately 1 day apart in two different
+# cases, each independently became its own anchor/row instead of being recognized as
+# the same application. Every genuine repeat-application gap actually observed in this
+# tracker's history is weeks or months, never days — 3 days leaves a wide, safe margin
+# below that while comfortably covering both incidents.
+ANCHOR_CLUSTER_MAX_GAP_DAYS = 3
+
+
+def _cluster_confirmations(items: list) -> list:
+    """Groups "new application confirmation" emails that share a normalized company+
+    role key into clusters — each cluster becomes ONE anchor (see group_results).
+    Clustered by proximity to the FIRST (earliest) item of the current cluster, not by
+    chaining consecutive gaps, so a slow drift of many-days-apart items can't
+    transitively pull genuinely separate applications into one cluster."""
+    items_sorted = sorted(items, key=_best_event_dt)
+    clusters: list = []
+    for it in items_sorted:
+        dt = _best_event_dt(it)
+        if clusters and (dt - _best_event_dt(clusters[-1][0])).days <= ANCHOR_CLUSTER_MAX_GAP_DAYS:
+            clusters[-1].append(it)
+        else:
+            clusters.append([it])
+    return clusters
+
+
 def group_results(results: list) -> list:
     """Groups scanned emails into review items. Identity hierarchy (deterministic, no
     LLM decides this):
@@ -691,9 +717,16 @@ def group_results(results: list) -> list:
        consolidate into one group (each email's target_sheet is computed independently
        from ITS OWN date; the group's actual home sheet is resolved separately in
        _build_group, from the earliest/anchor item). The SAME normalized key can have
-       several anchors (one per confirmation email) — the same person can genuinely
-       apply to the same company+role more than once, and each confirmation starts a
-       new, separate application group rather than merging into an older one.
+       several anchors — the same person can genuinely apply to the same company+role
+       more than once, and each confirmation starts a new, separate application group
+       rather than merging into an older one — BUT confirmations within
+       ANCHOR_CLUSTER_MAX_GAP_DAYS of each other are clustered into a single anchor
+       first (see _cluster_confirmations): two confirmation-shaped emails about the
+       SAME real application (an auto-ack plus a separate "thank you" notice, a
+       duplicate resend, etc.) land close together in time; confirmed live, this was
+       creating a duplicate row per extra confirmation email instead of one group.
+       Genuine repeat applications in this tracker's own history are always weeks or
+       months apart, well outside that window.
     4. Every other no-row-match email (not itself a confirmation) attaches to the most
        RECENT anchor of its own exact key that is dated on or before it — i.e. the
        still-open application as of that email's date. If no anchor qualifies (none
@@ -726,7 +759,9 @@ def group_results(results: list) -> list:
 
     anchor_buckets: dict = {}  # key -> list of (anchor_dt, items_list), one per anchor
     for key, items in anchors.items():
-        anchor_buckets[key] = [(_best_event_dt(it), [it]) for it in sorted(items, key=_best_event_dt)]
+        anchor_buckets[key] = [
+            (_best_event_dt(cluster[0]), cluster) for cluster in _cluster_confirmations(items)
+        ]
 
     archive_jobs_cache = None  # loaded lazily, at most once, only if the fallback below is actually needed
     archive_year_plus_one = app.ARCHIVE_SHEET_YEAR + 1
@@ -948,6 +983,13 @@ def _apply_new(group: dict, target_sheet, overrides: dict, already_applied_ids: 
     if not date_applied:
         ed = earliest["info"].get("email_date", "")
         date_applied = f"{ed} 00:00" if ed else ""
+    if not date_applied:
+        # Both AI date fields were empty for this email — confirmed live, this used to
+        # leave date_applied blank and let append_job() fall back to "right now" (the
+        # moment Apply happened to be clicked), which is misleading for a row that's
+        # actually about an email from months earlier. _best_event_dt's own fallback
+        # (Gmail's internalDate) is always available and reflects the real email.
+        date_applied = _best_event_dt(earliest).strftime("%Y-%m-%d %H:%M")
     data = {
         "company": overrides.get("company") or group["company"],
         "role": overrides.get("role") or group["role"],

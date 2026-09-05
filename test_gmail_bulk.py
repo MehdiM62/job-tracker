@@ -173,6 +173,44 @@ def test_two_separate_confirmations_same_company_role_stay_separate():
     check("the second confirmation stands alone (no later email yet)", len(by_first.get("m3", {"items": []})["items"]) == 1)
 
 
+# ── Real incidents: two confirmation-shaped emails close together in time for the same
+# application (an auto-ack plus a separate "thank you" notice) must consolidate into
+# ONE group instead of each creating its own duplicate row ──
+def test_close_together_confirmations_cluster_into_one_group():
+    JOBS_BY_SHEET[None] = []
+    c1 = mk_result("m1", "Thanks", None, None, [], mk_info("N26", "Agile Coach", "Applied", "2026-01-20", confirmation=True), ms_for(2026, 1, 20))
+    c2 = mk_result("m2", "Thanks again", None, None, [], mk_info("N26", "Agile Coach", "Applied", "2026-01-21", confirmation=True), ms_for(2026, 1, 21))
+    groups = gb.group_results([c1, c2])
+    check("two confirmations 1 day apart cluster into one group", len(groups) == 1)
+    check("the clustered group has both emails", groups[0]["email_count"] == 2)
+
+
+def test_confirmations_beyond_cluster_window_stay_separate():
+    JOBS_BY_SHEET[None] = []
+    c1 = mk_result("m1", "Thanks", None, None, [], mk_info("Cubiq Recruitment", "Engineering Manager", "Applied", "2026-01-02", confirmation=True), ms_for(2026, 1, 2))
+    c2 = mk_result("m2", "Thanks", None, None, [], mk_info("Cubiq Recruitment", "Engineering Manager", "Applied", "2026-01-08", confirmation=True), ms_for(2026, 1, 8))
+    groups = gb.group_results([c1, c2])
+    check("confirmations 6 days apart (beyond the cluster window) stay two separate groups", len(groups) == 2)
+
+
+def test_apply_new_falls_back_to_internal_date_not_now():
+    # Both AI date fields empty — must not silently fall through to append_job()'s own
+    # "now" default (a real incident: a row ended up dated the moment Apply was
+    # clicked instead of the actual, months-earlier email date).
+    JOBS_BY_SHEET[None] = []
+    appended = []
+    appmod.append_job = lambda data, sheet_name=None: (appended.append(data), 1)[1]
+    gb.log_processed_email = lambda *a, **k: None
+    info = mk_info("NoDateCo", "Some Role", "Applied", "", confirmation=True)
+    info["email_datetime"] = ""
+    ms = ms_for(2026, 1, 31)
+    item = mk_result("m1", "s", None, None, [], info, ms)
+    group = gb._build_group("new", ("new", None, "nodateco", "somerole", "m1"), [item])
+    gb.apply_group(group, {"comments": {}})
+    expected = datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+    check("date_applied falls back to the Gmail internalDate, not 'now'", appended[0]["date_applied"] == expected)
+
+
 # ── Cross-year consolidation ("Playson"): a 2025 confirmation + a 2026 status email
 # for the same normalized company+role must stay ONE group, homed in the 2025 sheet ──
 def test_cross_year_confirmation_and_rejection_consolidate_into_2025():
@@ -560,6 +598,9 @@ def main():
         test_same_company_different_roles_stay_separate,
         test_confirmation_then_later_rejection_becomes_one_new_group,
         test_two_separate_confirmations_same_company_role_stay_separate,
+        test_close_together_confirmations_cluster_into_one_group,
+        test_confirmations_beyond_cluster_window_stay_separate,
+        test_apply_new_falls_back_to_internal_date_not_now,
         test_cross_year_confirmation_and_rejection_consolidate_into_2025,
         test_cross_year_fallback_bounded_to_jan_feb,
         test_jan_feb_2026_fallback_matches_2025_row,
