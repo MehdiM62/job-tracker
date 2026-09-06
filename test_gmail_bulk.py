@@ -216,6 +216,50 @@ def test_apply_new_falls_back_to_internal_date_not_now():
     check("date_applied falls back to the Gmail internalDate, not 'now'", appended[0]["date_applied"] == expected)
 
 
+def test_apply_new_skips_when_a_near_identical_row_already_exists_live():
+    # Real incident (GLS/NXT): the same consolidated "new application" group got
+    # applied twice, producing two byte-for-byte identical rows — through a retry path
+    # distinct from the ones already fixed. This is the structural backstop: check the
+    # live sheet immediately before writing, regardless of what caused the retry.
+    appended = []
+    appmod.append_job = lambda data, sheet_name=None: (appended.append(data), 999)[1]
+    logged = []
+    gb.log_processed_email = lambda msg_id, *a, **k: logged.append(msg_id)
+
+    JOBS_BY_SHEET[None] = [{
+        "No.": "852", "Company": "GLS/NXT", "Role": "Senior Product Manager",
+        "Status": "Rejected", "Contact Person": "Not specified", "Date Applied": "2026-05-17 11:56",
+    }]
+    info = mk_info("GLS/NXT", "Senior Product Manager", "Rejected", "2026-05-17", confirmation=True, dt="2026-05-17 11:56")
+    item = mk_result("m1", "s", None, None, [], info, ms_for(2026, 5, 17))
+    group = gb._build_group("new", ("new", None, "glsnxt", "seniorproductmanager", "m1"), [item])
+
+    result = gb.apply_group(group, {"comments": {}})
+    check("a near-duplicate found live is treated as already applied", result.get("already_applied") is True)
+    check("append_job is never called when a near-identical row already exists", appended == [])
+    check("nothing gets logged for a skipped duplicate", logged == [])
+
+
+def test_apply_new_still_applies_when_existing_row_is_weeks_apart():
+    # The live-sheet check must not become a new false-positive source — a genuinely
+    # separate re-application weeks later must still go through normally.
+    appended = []
+    appmod.append_job = lambda data, sheet_name=None: (appended.append(data), 999)[1]
+    gb.log_processed_email = lambda *a, **k: None
+
+    JOBS_BY_SHEET[None] = [{
+        "No.": "1", "Company": "Recurring Co", "Role": "Consultant",
+        "Status": "Rejected", "Contact Person": "", "Date Applied": "2026-01-05 09:00",
+    }]
+    info = mk_info("Recurring Co", "Consultant", "Applied", "2026-03-01", confirmation=True, dt="2026-03-01 09:00")
+    item = mk_result("m1", "s", None, None, [], info, ms_for(2026, 3, 1))
+    group = gb._build_group("new", ("new", None, "recurringco", "consultant", "m1"), [item])
+
+    result = gb.apply_group(group, {"comments": {}})
+    check("a re-application ~2 months later is not mistaken for a duplicate", result.get("already_applied") is not True)
+    check("append_job is called normally for a genuinely separate application", len(appended) == 1)
+
+
 # ── Cross-year consolidation ("Playson"): a 2025 confirmation + a 2026 status email
 # for the same normalized company+role must stay ONE group, homed in the 2025 sheet ──
 def test_cross_year_confirmation_and_rejection_consolidate_into_2025():
@@ -715,6 +759,7 @@ class _FakeAppendJobWorksheet:
 
 def test_append_job_survives_a_renumber_failure():
     real_sleep = appmod.time.sleep
+    real_get_worksheet = appmod.get_worksheet
     appmod.time.sleep = lambda s: None
     try:
         existing = [["1", "2026-01-01 00:00", "ExistingCo", "Role", "", "", "", "", "", "Applied", "", "EN", "Other", "", "", ""]]
@@ -728,6 +773,7 @@ def test_append_job_survives_a_renumber_failure():
         new_no = _REAL_APPEND_JOB(data)
     finally:
         appmod.time.sleep = real_sleep
+        appmod.get_worksheet = real_get_worksheet  # this test's fake worksheet must not leak into later tests
     check("append_job does not raise when only the renumber step fails", new_no == 1)
     check("the renumber step was actually attempted (not silently skipped)", fake.renumber_attempted)
     check("the new row's own data was still written despite the renumber failure", fake.inserted is not None)
@@ -768,6 +814,8 @@ def main():
         test_with_sheets_retry_recovers_from_transient_errors_and_gives_up_on_others,
         test_insert_row_with_values_recovers_when_populate_step_fails_first,
         test_append_job_survives_a_renumber_failure,
+        test_apply_new_skips_when_a_near_identical_row_already_exists_live,
+        test_apply_new_still_applies_when_existing_row_is_weeks_apart,
     ]
     for t in tests:
         print(f"--- {t.__name__} ---")

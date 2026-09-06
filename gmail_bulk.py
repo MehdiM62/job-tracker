@@ -1001,6 +1001,38 @@ def _apply_new(group: dict, target_sheet, overrides: dict, already_applied_ids: 
         "cv_lang": "EN", "source": "Other", "match_level": "", "missing_skills": "",
         "date_applied": date_applied,
     }
+
+    # Final safety check against the LIVE sheet, right before writing — a
+    # belt-and-suspenders guard against duplicate creation regardless of what actually
+    # causes a retry to happen (several distinct causes have already been found and
+    # fixed; this catches any that haven't been, or ever will be, without needing to
+    # know the mechanism). If a row for the same normalized company+role already
+    # exists dated within ANCHOR_CLUSTER_MAX_GAP_DAYS of this one, this group has
+    # already been applied — creating another row would just duplicate it.
+    target_co = app.normalize_company(data["company"])
+    target_role = app.normalize_role(data["role"])
+    if target_co and target_role:
+        try:
+            new_dt = datetime.strptime(date_applied, "%Y-%m-%d %H:%M")
+        except ValueError:
+            new_dt = None
+        if new_dt is not None:
+            try:
+                existing_jobs = app.get_all_jobs(app.get_worksheet(target_sheet))
+            except Exception:
+                existing_jobs = []
+            for job in existing_jobs:
+                if app.normalize_company(str(job.get("Company", ""))) != target_co:
+                    continue
+                if app.normalize_role(str(job.get("Role", ""))) != target_role:
+                    continue
+                try:
+                    existing_dt = datetime.strptime(str(job.get("Date Applied", ""))[:16], "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue
+                if abs((new_dt - existing_dt).days) <= ANCHOR_CLUSTER_MAX_GAP_DAYS:
+                    return {"ok": True, "error": None, "applied": len(items), "already_applied": True}
+
     try:
         # NOT retried, deliberately: append_job() is a multi-step, non-idempotent
         # insert (read → compute position → insert row → renumber pushed-down rows).

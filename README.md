@@ -393,7 +393,12 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   rate-limit/transient error is retried automatically with backoff, and if a batch is
   ever interrupted partway through, clicking **Apply Approved Updates** again safely
   skips whatever was already successfully applied (checked against the Email Import
-  Log) instead of writing duplicate comments or duplicate application rows.
+  Log) instead of writing duplicate comments or duplicate application rows. As a second,
+  independent layer, creating a brand-new application row also checks the live sheet
+  itself immediately beforehand for a near-identical row (same company+role, applied
+  within a few days) and skips creating another one if it finds one — this catches a
+  duplicate regardless of what caused a retry, not just the specific causes already
+  found and fixed.
 - **Email Import Log**: a worksheet (auto-created, visible in your sheet tabs) records
   each Gmail message only *after* its update/creation is successfully applied — never
   merely for being scanned. Re-scanning the same period skips already-applied messages,
