@@ -682,6 +682,49 @@ def _year_month(email_date: str) -> tuple | None:
 ANCHOR_CLUSTER_MAX_GAP_DAYS = 3
 
 
+def _resolve_date_applied(earliest: dict) -> str:
+    """The "Date Applied" a new-application group would be written with — shared by
+    _apply_new (the real write) and _reclassify_stale_unmatched_groups (which needs
+    the same value just to compare against the live sheet, without writing anything)."""
+    date_applied = earliest["info"].get("email_datetime", "") or ""
+    if not date_applied:
+        ed = earliest["info"].get("email_date", "")
+        date_applied = f"{ed} 00:00" if ed else ""
+    if not date_applied:
+        # Both AI date fields were empty — Gmail's own internalDate (via
+        # _best_event_dt) is always available and reflects the real email, unlike
+        # falling back to "right now" (the moment a human happens to look at this).
+        date_applied = _best_event_dt(earliest).strftime("%Y-%m-%d %H:%M")
+    return date_applied
+
+
+def _find_existing_new_app_row(company: str, role: str, jobs: list, ref_dt: datetime):
+    """Returns the job dict from `jobs` for the same normalized company+role dated
+    within ANCHOR_CLUSTER_MAX_GAP_DAYS of ref_dt, or None if there's no such row. This
+    is "is this really the same application" — shared by _apply_new's pre-write safety
+    check (which only cares whether a match exists) and
+    _reclassify_stale_unmatched_groups's scan-finalize reclassification (which also
+    needs the row's own "No."), so both use the identical rule. Returns the row itself
+    rather than just its "No." so a match is never mistaken for "not found" merely
+    because that field happens to be blank."""
+    target_co = app.normalize_company(company)
+    target_role = app.normalize_role(role)
+    if not (target_co and target_role):
+        return None
+    for job in jobs:
+        if app.normalize_company(str(job.get("Company", ""))) != target_co:
+            continue
+        if app.normalize_role(str(job.get("Role", ""))) != target_role:
+            continue
+        try:
+            existing_dt = datetime.strptime(str(job.get("Date Applied", ""))[:16], "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        if abs((ref_dt - existing_dt).days) <= ANCHOR_CLUSTER_MAX_GAP_DAYS:
+            return job
+    return None
+
+
 def _cluster_confirmations(items: list) -> list:
     """Groups "new application confirmation" emails that share a normalized company+
     role key into clusters — each cluster becomes ONE anchor (see group_results).
@@ -810,6 +853,53 @@ def group_results(results: list) -> list:
             groups.append(_build_group("new", group_key, items))
     groups += [_build_group("single", ("single", r["message_id"]), [r]) for r in review_singles]
     return groups
+
+
+def _reclassify_stale_unmatched_groups(groups: list) -> list:
+    """group_results() only ever sees the ONE jobs_cache snapshot loaded during the
+    scan itself (see _scan_step) — it never learns about rows added to the sheet
+    afterwards. This feature is used in long, spread-out backfill sessions: a scan's
+    results can sit unreviewed in the queue while the SAME applications get added to
+    the sheet through a separate, later scan+apply pass (or a manual edit). Confirmed
+    live: 12+ companies (TechTree, Zeta Global, Grundfos, Superchat, Delivery Hero,
+    etc.) showed up in "🆕 Unmatched / New Applications" with an exact company+role
+    match already sitting in the sheet, dated the same day.
+
+    Right before the review queue is shown, re-run app.fuzzy_find_job — the exact same
+    deterministic matcher _scan_step already relies on — for every bucket=="unmatched"
+    group (both "new" anchors and unmatched "single" candidates — either can be stale
+    in exactly this way), against a FRESH read of its target sheet instead of the
+    scan's own stale jobs_cache. A clean, unique match relabels the group as "matched"
+    against that row, so the queue proposes an update instead of a duplicate-looking
+    "new application" — and it flows through the existing matched-group UI/low-value
+    filtering from there. Deliberately narrow: an AMBIGUOUS fresh result (more than one
+    candidate row) is left exactly as it was rather than guessed at — the existing
+    ambiguous-picker UI only ever sees ambiguity that fuzzy_find_job itself already
+    reported. One fresh sheet read per distinct target sheet actually present among
+    these groups, not per group."""
+    jobs_by_sheet: dict = {}
+    out = []
+    for g in groups:
+        if g["bucket"] != "unmatched":
+            out.append(g)
+            continue
+        target_sheet = g["target_sheet"]
+        if target_sheet not in jobs_by_sheet:
+            try:
+                jobs_by_sheet[target_sheet] = app.get_all_jobs(app.get_worksheet(target_sheet))
+            except Exception:
+                jobs_by_sheet[target_sheet] = []
+        earliest = g["items"][0]
+        matched_row, ambiguous_rows = app.fuzzy_find_job(
+            g["company"], g["role"], jobs_by_sheet[target_sheet],
+            email_date=earliest["info"].get("email_date", ""),
+        )
+        if matched_row is None or ambiguous_rows:
+            out.append(g)
+            continue
+        items = [dict(it, matched_row=matched_row, ambiguous_rows=[], target_sheet=target_sheet) for it in g["items"]]
+        out.append(_build_group("matched", ("row", target_sheet, matched_row), items))
+    return out
 
 
 def _is_low_value(g: dict) -> bool:
@@ -993,17 +1083,7 @@ def _apply_new(group: dict, target_sheet, overrides: dict, already_applied_ids: 
             seen_lines.add(key)
             combined_lines.append(line)
     combined_comments = "\n".join(combined_lines)
-    date_applied = earliest["info"].get("email_datetime", "") or ""
-    if not date_applied:
-        ed = earliest["info"].get("email_date", "")
-        date_applied = f"{ed} 00:00" if ed else ""
-    if not date_applied:
-        # Both AI date fields were empty for this email — confirmed live, this used to
-        # leave date_applied blank and let append_job() fall back to "right now" (the
-        # moment Apply happened to be clicked), which is misleading for a row that's
-        # actually about an email from months earlier. _best_event_dt's own fallback
-        # (Gmail's internalDate) is always available and reflects the real email.
-        date_applied = _best_event_dt(earliest).strftime("%Y-%m-%d %H:%M")
+    date_applied = _resolve_date_applied(earliest)
     data = {
         "company": overrides.get("company") or group["company"],
         "role": overrides.get("role") or group["role"],
@@ -1029,30 +1109,18 @@ def _apply_new(group: dict, target_sheet, overrides: dict, already_applied_ids: 
     # a phone) could each pass the check before either has written anything, then both
     # create a row. The lock makes that check-then-create step atomic with respect to
     # every other _apply_new() call in this same server process.
-    target_co = app.normalize_company(data["company"])
-    target_role = app.normalize_role(data["role"])
     with _new_application_lock():
-        if target_co and target_role:
+        try:
+            new_dt = datetime.strptime(date_applied, "%Y-%m-%d %H:%M")
+        except ValueError:
+            new_dt = None
+        if new_dt is not None:
             try:
-                new_dt = datetime.strptime(date_applied, "%Y-%m-%d %H:%M")
-            except ValueError:
-                new_dt = None
-            if new_dt is not None:
-                try:
-                    existing_jobs = app.get_all_jobs(app.get_worksheet(target_sheet))
-                except Exception:
-                    existing_jobs = []
-                for job in existing_jobs:
-                    if app.normalize_company(str(job.get("Company", ""))) != target_co:
-                        continue
-                    if app.normalize_role(str(job.get("Role", ""))) != target_role:
-                        continue
-                    try:
-                        existing_dt = datetime.strptime(str(job.get("Date Applied", ""))[:16], "%Y-%m-%d %H:%M")
-                    except ValueError:
-                        continue
-                    if abs((new_dt - existing_dt).days) <= ANCHOR_CLUSTER_MAX_GAP_DAYS:
-                        return {"ok": True, "error": None, "applied": len(items), "already_applied": True}
+                existing_jobs = app.get_all_jobs(app.get_worksheet(target_sheet))
+            except Exception:
+                existing_jobs = []
+            if _find_existing_new_app_row(data["company"], data["role"], existing_jobs, new_dt) is not None:
+                return {"ok": True, "error": None, "applied": len(items), "already_applied": True}
 
         try:
             # NOT retried, deliberately: append_job() is a multi-step, non-idempotent
@@ -1232,7 +1300,9 @@ def _render_scan_controls() -> None:
     st.markdown("  \n".join(lines))
 
     def _finalize(cancelled: bool) -> None:
-        groups, low_value_skipped = _partition_low_value(group_results(runtime["results"]))
+        groups, low_value_skipped = _partition_low_value(
+            _reclassify_stale_unmatched_groups(group_results(runtime["results"]))
+        )
         elapsed = time.monotonic() - runtime["start_time"]
         providers = st.session_state.get("llm_providers_used", [])
         st.session_state["bulk_groups"] = groups

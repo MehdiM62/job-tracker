@@ -801,6 +801,92 @@ def test_fuzzy_find_job_short_name_still_wont_substring_match():
     check("a short name still does not substring-match an unrelated longer company name", row is None and ambiguous == [])
 
 
+# ── Real incident: 12+ "new"-kind groups (Zeta Global, Grundfos, Superchat, TechTree,
+# etc.) sat in the review queue as "🆕 Unmatched / New Applications" long after the
+# same applications had already been added to the sheet through a separate, later
+# scan+apply pass — group_results() only ever sees the ONE jobs_cache snapshot loaded
+# during the scan itself, so it never learns about rows added afterwards. ──
+def test_reclassify_stale_new_group_relabels_as_matched():
+    JOBS_BY_SHEET[None] = []
+    r = mk_result(
+        "m1", "App received", None, None, [],
+        mk_info("Zeta Global", "Senior Product Manager", "Applied", "2026-08-17", confirmation=True, dt="2026-08-17 00:28"),
+        ms_for(2026, 8, 17),
+    )
+    groups = gb.group_results([r])
+    check("scanned against an empty sheet -> classified as new", groups[0]["kind"] == "new" and groups[0]["bucket"] == "unmatched")
+
+    # The application gets added to the sheet through a separate scan+apply pass
+    # before the user gets around to reviewing this stale queue entry.
+    JOBS_BY_SHEET[None] = [{
+        "No.": "1143", "Company": "Zeta Global", "Role": "Senior Product Manager",
+        "Status": "Applied", "Contact Person": "Not specified", "Company Comments": "",
+        "Date Applied": "2026-08-17 00:28",
+    }]
+    reclassified = gb._reclassify_stale_unmatched_groups(groups)
+    check("reclassified as matched against the now-existing row", reclassified[0]["kind"] == "matched")
+    check("matched row is the existing row's own No.", reclassified[0]["matched_row"] == "1143")
+    check("bucket is no longer unmatched", reclassified[0]["bucket"] != "unmatched")
+
+
+def test_reclassify_catches_company_text_variants_via_fuzzy_find_job():
+    # A second confirmed live case (TechTree): the existing row's company text is a
+    # variant ("TechTree's client"), not identical — fuzzy_find_job's own substring
+    # matching (already relied on at scan time) must still catch this on the fresh
+    # re-check, not just an exact-string comparison.
+    JOBS_BY_SHEET[None] = [{
+        "No.": "1177", "Company": "TechTree's client", "Role": "Product Engineer",
+        "Status": "Applied", "Contact Person": "Not specified", "Company Comments": "",
+        "Date Applied": "2026-08-26 00:39",
+    }]
+    r = mk_result(
+        "m2", "App received", None, None, [],
+        mk_info("TechTree", "Product Engineer", "Applied", "2026-08-26", confirmation=True, dt="2026-08-26 00:39"),
+        ms_for(2026, 8, 26),
+    )
+    groups = gb.group_results([r])
+    reclassified = gb._reclassify_stale_unmatched_groups(groups)
+    check(
+        "company-text variant still reclassified via fuzzy_find_job's substring matching",
+        reclassified[0]["kind"] == "matched" and reclassified[0]["matched_row"] == "1177",
+    )
+
+
+def test_reclassify_leaves_genuinely_new_group_alone():
+    JOBS_BY_SHEET[None] = []
+    r = mk_result(
+        "m3", "App received", None, None, [],
+        mk_info("BrandNewCo", "Analyst", "Applied", "2026-08-20", confirmation=True, dt="2026-08-20 09:00"),
+        ms_for(2026, 8, 20),
+    )
+    groups = gb.group_results([r])
+    reclassified = gb._reclassify_stale_unmatched_groups(groups)
+    check(
+        "a genuinely new application (no matching row anywhere) is left alone",
+        reclassified[0]["kind"] == "new" and reclassified[0]["bucket"] == "unmatched",
+    )
+
+
+def test_reclassify_leaves_ambiguous_fresh_match_alone():
+    # Two already-tracked rows for the same normalized company+role (a real repeat
+    # application) — the fresh re-check must not silently guess between them; it should
+    # leave the group exactly as it was, same as fuzzy_find_job's own ambiguity rule.
+    JOBS_BY_SHEET[None] = [
+        {"No.": "50", "Company": "Ambigu Corp", "Role": "PM (m/w/d)", "Status": "Rejected",
+         "Contact Person": "Not specified", "Company Comments": "", "Date Applied": "2025-01-01"},
+        {"No.": "51", "Company": "Ambigu Corp", "Role": "PM", "Status": "Applied",
+         "Contact Person": "Not specified", "Company Comments": "", "Date Applied": "2026-08-01"},
+    ]
+    r = mk_result(
+        "m4", "App received", None, None, [],
+        mk_info("Ambigu Corp", "PM", "Applied", "2026-08-05", confirmation=True, dt="2026-08-05 09:00"),
+        ms_for(2026, 8, 5),
+    )
+    groups = gb.group_results([r])
+    reclassified = gb._reclassify_stale_unmatched_groups(groups)
+    check("an ambiguous fresh match is left untouched rather than guessed at", reclassified[0]["kind"] == "new")
+
+
 # ── Real incident: two concurrent sessions (e.g. this account open on a laptop and a
 # phone at once) could each pass the "does this already exist" check before either had
 # written anything, and both create a row. Verify the process-wide lock actually
@@ -890,6 +976,10 @@ def main():
         test_apply_new_still_applies_when_existing_row_is_weeks_apart,
         test_fuzzy_find_job_exact_matches_short_company_names,
         test_fuzzy_find_job_short_name_still_wont_substring_match,
+        test_reclassify_stale_new_group_relabels_as_matched,
+        test_reclassify_catches_company_text_variants_via_fuzzy_find_job,
+        test_reclassify_leaves_genuinely_new_group_alone,
+        test_reclassify_leaves_ambiguous_fresh_match_alone,
         test_new_application_lock_prevents_concurrent_duplicate_creation,
     ]
     for t in tests:

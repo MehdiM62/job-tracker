@@ -434,6 +434,15 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   plus a separate "thank you" notice, say) are also treated as one application rather
   than each starting its own — genuine repeat applications are weeks or months apart
   in practice, never days.
+- **A "new application" you already added since scanning is caught before you approve
+  it**: a scan's review queue is built once, from a sheet snapshot taken during that
+  scan — it doesn't automatically notice rows added afterwards through a separate
+  scan+apply pass (or a manual edit). Right before the queue is shown, every item
+  labeled "🆕 Unmatched / New Application" is re-checked with a fresh read of the
+  sheet, using the exact same matching logic the scan itself relies on; a clean match
+  relabels it as a proposed update against that existing row instead of a duplicate-
+  looking new one. A genuinely ambiguous fresh result (more than one candidate row) is
+  left exactly as it was rather than guessed at.
 - **Low-value proposals are filtered out of the review queue**: a proposed status
   regression from Rejected back to Applied, a redundant Applied→Applied update with
   nothing new to add (unless it would fill in a currently-blank contact), and a
