@@ -547,6 +547,18 @@ def fuzzy_find_job(matched_company: str, matched_role: str, jobs: list, email_da
         co_matches = [j for j in jobs if (co := normalize_company(str(j.get("Company", "")))) and (target_co in co or co in target_co)]
         if len(co_matches) == 1:
             return co_matches[0].get("No."), []
+    elif target_co:
+        # Short normalized names (e.g. "N26" -> "n26", 3 chars) never reach the
+        # substring path above — that's the exact false-positive risk it exists to
+        # avoid ("sap" inside "sapient"). But an EXACT match carries none of that
+        # risk: it only fires when another tracked row's company ALSO normalizes to
+        # the identical string. Confirmed live: without this, "N26" could never be
+        # matched back to its own already-tracked row no matter how many status
+        # emails arrived for it — every one silently became an orphaned "new
+        # application" instead of updating the existing one.
+        co_matches = [j for j in jobs if normalize_company(str(j.get("Company", ""))) == target_co]
+        if len(co_matches) == 1:
+            return co_matches[0].get("No."), []
 
     if not co_matches:
         # No company keyword overlap with anything tracked — most often because this

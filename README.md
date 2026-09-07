@@ -398,7 +398,16 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
   itself immediately beforehand for a near-identical row (same company+role, applied
   within a few days) and skips creating another one if it finds one — this catches a
   duplicate regardless of what caused a retry, not just the specific causes already
-  found and fixed.
+  found and fixed. That check-then-create step is also serialized with a process-wide
+  lock, since this account being open in more than one tab or device at once (e.g.
+  laptop and phone together) is itself a way two applies could otherwise race each
+  other and both create a row before either finishes.
+- **Very short company names (e.g. "N26") match correctly too**: matching normally
+  requires a few characters of company-name overlap to avoid false positives (a short
+  name like "SAP" wrongly matching "Sapient"), but that used to mean a 2–3 character
+  normalized name could never match its own tracked row at all, no matter how many
+  status emails arrived for it. An exact (not substring) match now bypasses that
+  minimum, so it doesn't reopen the original false-positive risk.
 - **Email Import Log**: a worksheet (auto-created, visible in your sheet tabs) records
   each Gmail message only *after* its update/creation is successfully applied — never
   merely for being scanned. Re-scanning the same period skips already-applied messages,

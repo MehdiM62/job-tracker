@@ -13,6 +13,8 @@ stand-ins.
 import importlib.util
 import inspect
 import sys
+import threading
+import time as _time_module
 from datetime import date, datetime
 from pathlib import Path
 
@@ -779,6 +781,76 @@ def test_append_job_survives_a_renumber_failure():
     check("the new row's own data was still written despite the renumber failure", fake.inserted is not None)
 
 
+# ── Real incident: "N26" normalizes to "n26" (3 chars), below fuzzy_find_job's
+# 4-character minimum for its substring-match path — meaning it could NEVER match its
+# own already-tracked row, no matter how many status emails arrived for it. Verify the
+# exact-match fallback fixes this without reopening the "SAP matches Sapient" risk the
+# length minimum exists to prevent. ──
+def test_fuzzy_find_job_exact_matches_short_company_names():
+    jobs = [{"No.": 42, "Company": "N26", "Role": "Agile Coach", "Date Applied": "2026-01-01"}]
+    row, ambiguous = appmod.fuzzy_find_job("N26", "Agile Coach", jobs, email_date="2026-07-01")
+    check("a short company name (N26) now matches its own already-tracked row exactly", row == 42)
+    check("no ambiguity reported for a clean exact match", ambiguous == [])
+
+
+def test_fuzzy_find_job_short_name_still_wont_substring_match():
+    # The exact-match fallback must not reopen the original false-positive risk: a
+    # short target should still NOT match a longer company name that merely contains it.
+    jobs = [{"No.": 1, "Company": "Sapient", "Role": "Consultant", "Date Applied": "2026-01-01"}]
+    row, ambiguous = appmod.fuzzy_find_job("SAP", "Consultant", jobs, email_date="2026-07-01")
+    check("a short name still does not substring-match an unrelated longer company name", row is None and ambiguous == [])
+
+
+# ── Real incident: two concurrent sessions (e.g. this account open on a laptop and a
+# phone at once) could each pass the "does this already exist" check before either had
+# written anything, and both create a row. Verify the process-wide lock actually
+# serializes this instead of just existing as an unused decoration. ──
+def test_new_application_lock_prevents_concurrent_duplicate_creation():
+    JOBS_BY_SHEET[None] = []
+    appended = []
+    read_lock = threading.Lock()  # protects the test double's own bookkeeping only
+
+    def fake_get_all_jobs(ws):
+        with read_lock:
+            jobs = [dict(j) for j in JOBS_BY_SHEET.get(ws, [])]
+        _time_module.sleep(0.05)  # widen the race window an unlocked version would fall into
+        return jobs
+
+    def fake_append_job(data, sheet_name=None):
+        with read_lock:
+            appended.append(data)
+            JOBS_BY_SHEET.setdefault(sheet_name, []).append({
+                "Company": data["company"], "Role": data["role"], "Date Applied": data["date_applied"],
+            })
+        return len(appended)
+
+    appmod.get_all_jobs = fake_get_all_jobs
+    appmod.append_job = fake_append_job
+    gb.log_processed_email = lambda *a, **k: None
+
+    info = mk_info("RaceCo", "Race Role", "Applied", "2026-01-01", confirmation=True, dt="2026-01-01 09:00")
+    item = mk_result("m1", "s", None, None, [], info, ms_for(2026, 1, 1))
+    group = gb._build_group("new", ("new", None, "raceco", "racerole", "m1"), [item])
+
+    results = []
+    results_lock = threading.Lock()
+
+    def worker():
+        r = gb.apply_group(group, {"comments": {}})
+        with results_lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    check("only one of two concurrent applies for the same application actually created a row", len(appended) == 1)
+    check("the other correctly recognized it as already applied instead of duplicating it",
+          sum(1 for r in results if r.get("already_applied")) == 1)
+
+
 def main():
     tests = [
         test_canonical_status_fixes_case_sensitivity,
@@ -816,6 +888,9 @@ def main():
         test_append_job_survives_a_renumber_failure,
         test_apply_new_skips_when_a_near_identical_row_already_exists_live,
         test_apply_new_still_applies_when_existing_row_is_weeks_apart,
+        test_fuzzy_find_job_exact_matches_short_company_names,
+        test_fuzzy_find_job_short_name_still_wont_substring_match,
+        test_new_application_lock_prevents_concurrent_duplicate_creation,
     ]
     for t in tests:
         print(f"--- {t.__name__} ---")

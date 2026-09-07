@@ -873,6 +873,20 @@ def _low_value_reason(g: dict) -> str:
 
 # ── Apply (the only writes in this module) ───────────────────────────────────
 
+@st.cache_resource
+def _new_application_lock():
+    """Process-wide (not per-session) lock serializing _apply_new()'s check-then-create
+    step. Closes a real race: this account can be open in more than one browser tab or
+    device at once (e.g. laptop + phone) — each gets its own independent Streamlit
+    session, so two of them could each read the sheet, see no existing row yet for the
+    same application, and both create one moments apart. A plain in-process lock is
+    enough here since this app runs as a single Streamlit Cloud instance, not scaled
+    across multiple server processes — it wouldn't help if that ever changed, but nothing
+    about this app's deployment does."""
+    import threading
+    return threading.Lock()
+
+
 def _apply_with_retry(fn, *args, max_attempts=4, **kwargs):
     """Retries a Sheets-API call with exponential backoff (1s, 2s, 4s) on a rate-
     limit/transient error (429/500/503).
@@ -1009,43 +1023,50 @@ def _apply_new(group: dict, target_sheet, overrides: dict, already_applied_ids: 
     # know the mechanism). If a row for the same normalized company+role already
     # exists dated within ANCHOR_CLUSTER_MAX_GAP_DAYS of this one, this group has
     # already been applied — creating another row would just duplicate it.
+    #
+    # The check and the row creation both happen under _new_application_lock() —
+    # without it, two concurrent sessions (e.g. this account open on both a laptop and
+    # a phone) could each pass the check before either has written anything, then both
+    # create a row. The lock makes that check-then-create step atomic with respect to
+    # every other _apply_new() call in this same server process.
     target_co = app.normalize_company(data["company"])
     target_role = app.normalize_role(data["role"])
-    if target_co and target_role:
-        try:
-            new_dt = datetime.strptime(date_applied, "%Y-%m-%d %H:%M")
-        except ValueError:
-            new_dt = None
-        if new_dt is not None:
+    with _new_application_lock():
+        if target_co and target_role:
             try:
-                existing_jobs = app.get_all_jobs(app.get_worksheet(target_sheet))
-            except Exception:
-                existing_jobs = []
-            for job in existing_jobs:
-                if app.normalize_company(str(job.get("Company", ""))) != target_co:
-                    continue
-                if app.normalize_role(str(job.get("Role", ""))) != target_role:
-                    continue
+                new_dt = datetime.strptime(date_applied, "%Y-%m-%d %H:%M")
+            except ValueError:
+                new_dt = None
+            if new_dt is not None:
                 try:
-                    existing_dt = datetime.strptime(str(job.get("Date Applied", ""))[:16], "%Y-%m-%d %H:%M")
-                except ValueError:
-                    continue
-                if abs((new_dt - existing_dt).days) <= ANCHOR_CLUSTER_MAX_GAP_DAYS:
-                    return {"ok": True, "error": None, "applied": len(items), "already_applied": True}
+                    existing_jobs = app.get_all_jobs(app.get_worksheet(target_sheet))
+                except Exception:
+                    existing_jobs = []
+                for job in existing_jobs:
+                    if app.normalize_company(str(job.get("Company", ""))) != target_co:
+                        continue
+                    if app.normalize_role(str(job.get("Role", ""))) != target_role:
+                        continue
+                    try:
+                        existing_dt = datetime.strptime(str(job.get("Date Applied", ""))[:16], "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        continue
+                    if abs((new_dt - existing_dt).days) <= ANCHOR_CLUSTER_MAX_GAP_DAYS:
+                        return {"ok": True, "error": None, "applied": len(items), "already_applied": True}
 
-    try:
-        # NOT retried, deliberately: append_job() is a multi-step, non-idempotent
-        # insert (read → compute position → insert row → renumber pushed-down rows).
-        # This module used to wrap it in retry-on-429 — if the insert itself had
-        # already succeeded and a LATER step in that same call then hit a transient
-        # error, the retry re-ran the entire function and inserted a second, duplicate
-        # row. Confirmed live: this produced real duplicate application rows and a
-        # corrupted No. column. A genuine failure here should surface as "failed" so
-        # the user re-approves deliberately — apply_group()'s already_applied_ids check
-        # then safely skips it if it turns out the row really was created already.
-        row_no = app.append_job(data, sheet_name=target_sheet)
-    except Exception as e:
-        return {"ok": False, "error": str(e), "applied": 0}
+        try:
+            # NOT retried, deliberately: append_job() is a multi-step, non-idempotent
+            # insert (read → compute position → insert row → renumber pushed-down rows).
+            # This module used to wrap it in retry-on-429 — if the insert itself had
+            # already succeeded and a LATER step in that same call then hit a transient
+            # error, the retry re-ran the entire function and inserted a second, duplicate
+            # row. Confirmed live: this produced real duplicate application rows and a
+            # corrupted No. column. A genuine failure here should surface as "failed" so
+            # the user re-approves deliberately — apply_group()'s already_applied_ids check
+            # then safely skips it if it turns out the row really was created already.
+            row_no = app.append_job(data, sheet_name=target_sheet)
+        except Exception as e:
+            return {"ok": False, "error": str(e), "applied": 0}
     for item in items:
         try:
             _apply_with_retry(
