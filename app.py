@@ -1917,6 +1917,21 @@ def main():
             else:
                 selected_row_no = job_options[selected_label]
 
+                # Fields the matched row is currently missing that this email actually
+                # names — e.g. a row added without a recruiter contact, and this email's
+                # signature has one. update_job_from_email() would silently backfill
+                # these anyway (never overwriting a cell that already has real content),
+                # but surfacing them here lets the user see and correct the extracted
+                # value BEFORE it's written, instead of only finding out from the
+                # "also filled in ..." note after the fact.
+                current_row = next((j for j in jobs if str(j.get("No.")) == str(selected_row_no)), None)
+                backfill_candidates = [
+                    (col_name, info_key) for col_name, info_key in BACKFILL_FIELDS
+                    if current_row is not None
+                    and _is_blank_field(current_row.get(col_name, ""))
+                    and not _is_blank_field(r.get(info_key, ""))
+                ]
+
                 with st.form("email_form"):
                     c1, c2 = st.columns(2)
                     with c1:
@@ -1944,6 +1959,16 @@ def main():
                         height=200,
                     )
 
+                    backfill_inputs = {}
+                    if backfill_candidates:
+                        st.markdown(f"**Also found in this email — Row {selected_row_no} has no {', '.join(c for c, _ in backfill_candidates).lower()} on file yet:**")
+                        cols = st.columns(len(backfill_candidates))
+                        for col_widget, (col_name, info_key) in zip(cols, backfill_candidates):
+                            with col_widget:
+                                backfill_inputs[info_key] = st.text_input(
+                                    col_name, value=str(r.get(info_key, "")).strip(), key=f"email_backfill_{info_key}",
+                                )
+
                     apply_btn = st.form_submit_button(
                         "✅ Update Sheet", type="primary", use_container_width=True,
                         disabled=st.session_state.get("updating_sheet", False),
@@ -1951,14 +1976,17 @@ def main():
 
                 if apply_btn:
                     st.session_state["updating_sheet"] = True
+                    st.session_state["email_backfill_overrides"] = backfill_inputs
                     st.rerun()
 
                 if st.session_state.get("updating_sheet"):
                     with st.spinner("Updating sheet..."):
                         try:
+                            email_info = dict(r)
+                            email_info.update(st.session_state.get("email_backfill_overrides") or {})
                             ok, filled_fields = update_job_from_email(
                                 selected_row_no, new_status, company_comments, email_date,
-                                sheet_name=target_sheet, email_info=r,
+                                sheet_name=target_sheet, email_info=email_info,
                             )
                             if ok:
                                 sheet_note = f" ({target_sheet} sheet)" if target_sheet else ""
@@ -1969,6 +1997,7 @@ def main():
                                 st.session_state.pop("email_parsed", None)
                                 st.session_state.pop("email_jobs", None)
                                 st.session_state.pop("email_target_sheet", None)
+                                st.session_state.pop("email_backfill_overrides", None)
                                 st.session_state["email_key"] += 1  # clears email text area
                                 st.session_state["updating_sheet"] = False
                                 st.rerun()
