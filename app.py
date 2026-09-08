@@ -962,7 +962,12 @@ def append_job(data: dict, sheet_name: str | None = None) -> int:
         ]
         if bumped:
             try:
-                _with_sheets_retry(ws.update, bumped, renumber_range, value_input_option="RAW")
+                # USER_ENTERED (not RAW) so a bumped "No." lands as a real number, the
+                # same as it would if typed into the sheet — RAW here used to store it
+                # as plain text instead, leaving No. cells inconsistently typed (some
+                # numbers, some text) depending on whether a row had ever been bumped
+                # by a later backdated insert.
+                _with_sheets_retry(ws.update, bumped, renumber_range, value_input_option="USER_ENTERED")
             except Exception:
                 # The new row itself is already safely inserted with the correct data
                 # and its own correct new_no — only the OTHER rows pushed down by it
