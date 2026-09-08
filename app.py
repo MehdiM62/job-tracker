@@ -1632,6 +1632,12 @@ def main():
                     height=120,
                 )
                 job_url    = st.text_input("Job URL", value=st.session_state.get("job_url", ""))
+                job_url_2  = st.text_input(
+                    "Job URL 2 (optional)",
+                    help="A second posting for this same application (e.g. the same role "
+                         "listed on the company's own site) — appended to Job URL as a new "
+                         "line in the sheet, not a separate column.",
+                )
 
                 submitted = st.form_submit_button(
                     "✅ Add to Google Sheet", type="primary", use_container_width=True,
@@ -1650,7 +1656,11 @@ def main():
                     st.session_state["adding_job"] = False
                     st.rerun()
 
-                sig = ("add_job", company.strip().lower(), role.strip().lower(), job_url.strip(), date_applied.strip())
+                combined_url = job_url.strip()
+                if job_url_2.strip():
+                    combined_url = f"{combined_url}\n\n{job_url_2.strip()}" if combined_url else job_url_2.strip()
+
+                sig = ("add_job", company.strip().lower(), role.strip().lower(), combined_url, date_applied.strip())
                 if _is_duplicate_submission(sig):
                     st.session_state["success_msg"] = "Already added that one — skipped a duplicate submission."
                     st.session_state["input_key"] += 1
@@ -1664,7 +1674,7 @@ def main():
                         row_no = append_job({
                             "company": company, "role": role, "city": city,
                             "language_req": lang_req, "key_skills": key_skills,
-                            "contact_person": contact, "url": job_url,
+                            "contact_person": contact, "url": combined_url,
                             "status": status, "comments": comments,
                             "cv_lang": cv_edit, "source": source,
                             "match_level": match.get("match_level", "") if match else "",
