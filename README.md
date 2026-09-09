@@ -7,7 +7,7 @@ A Streamlit web app that extracts job details from any URL using AI and saves th
 - Falls back to manual paste for sites that block scrapers (LinkedIn, etc.)
 - Optional job-fit matching against your career profile (Match Level + Missing Skills)
 - Source dropdown auto-detected from the URL, with an "Other" option for custom sources
-- CV Language toggle (EN / DE)
+- CV Language toggle (EN / DE) plus a separate free-text CV Version field, so you can track which specific CV variant performs better
 - Date Applied auto-set to current CET time, editable if you're backfilling a past application — the sheet stays sorted by date, inserting the row in the right place and renumbering No. automatically
 - Editable review form before saving
 - Writes directly to your Google Sheet
@@ -501,10 +501,11 @@ Approved Updates** may write, and only for items you've explicitly marked **Appr
 | N | Company Comments | Appended history from the Update from Email tab |
 | O | Match Level | % fit vs. your career profile (if configured) |
 | P | Missing Skills | Gaps vs. your career profile (if configured) |
+| Q | CV Version | Which CV file/variant you used — your input |
 
 Column M (Source) must exist in your sheet's header row before you start — add "Source" as
-the header of column M if it isn't there yet. Columns N–P (Company Comments, Match Level,
-Missing Skills) are created automatically on first run if they don't already exist.
+the header of column M if it isn't there yet. Columns N–Q (Company Comments, Match Level,
+Missing Skills, CV Version) are created automatically on first run if they don't already exist.
 
 ---
 
@@ -512,6 +513,7 @@ Missing Skills) are created automatically on first run if they don't already exi
 
 - **LinkedIn / auth-required sites**: use the "paste manually" option — copy the job description text from the page and paste it in
 - **CV Language**: toggle between EN and DE before or after parsing; you can also change it in the review form
+- **CV Version**: free-text field in the review form for which specific CV file/variant you used (e.g. `Backend_v2`) — keeps this independent of CV Language so you can compare interview rates by CV version, by language, or both
 - **Status**: change from "Applied" in the review form if needed (Interview, Offer, etc.)
 - **Source**: auto-detected from the job URL when possible; pick "Other" in the dropdown to enter a custom source (e.g. referral, career fair) — leave the text box blank to just record "Other"
 - **Update from Email**: paste the email as-is (subject + body); the AI reads the email's own date, matches it to a job, and appends a new dated entry to Company Comments — it never overwrites earlier entries, so you get a full timeline per application. The AI only ever sees the email itself — never your job list — because it's reliably accurate at extracting the company, role, status, and dates from the email text alone; matching that extraction to a specific row is instead done locally and deterministically against your *full* job history (e.g. inferring the company from a sender domain like `@bbraun.com`, or catching a duplicate paste of an email you already added) — you'll see a "🔎 matched by company and role" note asking you to confirm it. If a company has only one tracked application, that's matched on company alone — an email's own wording of a role (say, from a subject line) is often the full official title rather than the shortened one stored when the job was added, so requiring both to line up there would fail for no reason. Once a company has more than one tracked application, both company **and** role need to match, so a different role at a company you've applied to before (or an old rejected attempt) doesn't get misfiled against the wrong row — role matching only strips a gender/diversity marker like "(m/w/d)", never other parenthetical content, since titles routinely use parens for a real differentiator too (e.g. "(Logistics - Customer, Time & Tracking)" distinguishing one open role from another very similarly named one at the same company). When several of a company's roles still share a common prefix, an exact title match is preferred over a partial one rather than treating them as equally ambiguous. (An earlier design asked the AI to also cite the row number directly from a list of all applications — dropped because citing an exact row out of 900+ candidates turned out to be unreliable even when the company/role extraction was correct, occasionally pointing at the wrong application with high stated confidence.)

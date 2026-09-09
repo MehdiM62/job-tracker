@@ -725,11 +725,11 @@ def _insert_row_with_values(ws, row_values: list, sheet_row: int) -> None:
     )
 
 
-EXTRA_COLS = ["Company Comments", "Match Level", "Missing Skills"]
+EXTRA_COLS = ["Company Comments", "Match Level", "Missing Skills", "CV Version"]
 
 def ensure_extra_cols(ws) -> dict:
-    """Ensures Company Comments, Match Level, and Missing Skills columns exist.
-    Returns dict of column_name → 1-based index."""
+    """Ensures Company Comments, Match Level, Missing Skills, and CV Version columns
+    exist. Returns dict of column_name → 1-based index."""
     header = ws.row_values(1)
     indices = {}
     next_col = len([h for h in header if h.strip()]) + 1
@@ -780,7 +780,7 @@ def format_row(ws, row_num: int, bullet_texts: list) -> None:
             },
         },
         {
-            "range": f"A{row_num}:P{row_num}",
+            "range": f"A{row_num}:Q{row_num}",
             "format": {"verticalAlignment": "TOP", "wrapStrategy": "CLIP"},
         },
     ])
@@ -847,7 +847,7 @@ def normalize_sheet_formatting(ws) -> dict:
         "repeatCell": {
             "range": {
                 "sheetId": ws.id, "startRowIndex": 1, "endRowIndex": n_rows + 1,
-                "startColumnIndex": 0, "endColumnIndex": 16,
+                "startColumnIndex": 0, "endColumnIndex": 17,
             },
             "cell": {"userEnteredFormat": {"verticalAlignment": "TOP", "wrapStrategy": "CLIP"}},
             "fields": "userEnteredFormat.verticalAlignment,userEnteredFormat.wrapStrategy",
@@ -937,6 +937,7 @@ def append_job(data: dict, sheet_name: str | None = None) -> int:
         "",                              # N — Company Comments
         match_display,                   # O — Match Level
         data.get("missing_skills", ""),  # P — Missing Skills
+        data.get("cv_version", ""),      # Q — CV Version
     ]
 
     if insert_idx == total_existing:
@@ -1620,6 +1621,12 @@ def main():
                         index=0 if st.session_state.get("cv_lang", "EN") == "EN" else 1,
                         horizontal=True,
                     )
+                    cv_version = st.text_input(
+                        "CV Version",
+                        value=st.session_state.get("cv_version", ""),
+                        help="Which CV file/variant you used (e.g. Backend_v2) — "
+                             "lets you later compare interview rates by CV version.",
+                    )
 
                 date_applied = st.text_input(
                     "Date Applied (CET)",
@@ -1681,7 +1688,7 @@ def main():
                             "language_req": lang_req, "key_skills": key_skills,
                             "contact_person": contact, "url": combined_url,
                             "status": status, "comments": comments,
-                            "cv_lang": cv_edit, "source": source,
+                            "cv_lang": cv_edit, "cv_version": cv_version.strip(), "source": source,
                             "match_level": match.get("match_level", "") if match else "",
                             "missing_skills": missing_skills,
                             "date_applied": date_applied.strip(),
@@ -1689,6 +1696,7 @@ def main():
                         _mark_submitted(sig)
                         st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
                         st.session_state["cv_lang"] = cv_edit
+                        st.session_state["cv_version"] = cv_version.strip()
                         st.session_state["last_source"] = source
                         st.session_state["input_key"] += 1
                         st.session_state.pop("parsed", None)
@@ -1877,6 +1885,11 @@ def main():
                     new_comments = st.text_area(
                         "Comments", value=r.get("company_comments", ""), height=120,
                     )
+                    new_cv_version = st.text_input(
+                        "CV Version",
+                        value=st.session_state.get("cv_version", ""),
+                        help="Which CV file/variant you used for this application.",
+                    )
 
                     add_btn = st.form_submit_button(
                         "➕ Add to Google Sheet", type="primary", use_container_width=True,
@@ -1911,11 +1924,13 @@ def main():
                                 "company": new_company, "role": new_role, "city": "",
                                 "language_req": "", "key_skills": "", "contact_person": new_contact,
                                 "url": "", "status": "Applied", "comments": new_comments,
-                                "cv_lang": st.session_state.get("cv_lang", "EN"), "source": "Other",
+                                "cv_lang": st.session_state.get("cv_lang", "EN"),
+                                "cv_version": new_cv_version.strip(), "source": "Other",
                                 "match_level": "", "missing_skills": "",
                                 "date_applied": new_date.strip(),
                             }, sheet_name=target_sheet)
                             _mark_submitted(sig)
+                            st.session_state["cv_version"] = new_cv_version.strip()
                             sheet_note = f" ({target_sheet} sheet)" if target_sheet else ""
                             st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet{sheet_note}!"
                             st.session_state.pop("email_parsed", None)
