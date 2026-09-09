@@ -31,6 +31,16 @@ CET = pytz.timezone("Europe/Berlin")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 STATUSES = ["Applied", "Interview", "Assessment", "Offer", "Rejected", "Withdrawn"]
 
+# Seed choices for the CV Version dropdown — merged at render time with any custom
+# names saved via _remember_cv_version (see get_known_cv_versions below).
+DEFAULT_CV_VERSIONS = [
+    "Mehdi_Mokhtari_CV",
+    "Mehdi_Mokhtari_CV_DE",
+    "Mehdi_Mokhtari_CV_Platform",
+    "Mehdi_Mokhtari_CV_Platform_DE",
+]
+NEW_CV_VERSION = "➕ Enter new version..."
+
 # The spreadsheet has a tab per year — sheet1 (the default get_worksheet() target) is the
 # current year's tab; ARCHIVE_SHEET_NAME is the prior year's, kept around for emails that
 # reference an application tracked there. Only the "Update from Email" flow ever routes to
@@ -725,11 +735,16 @@ def _insert_row_with_values(ws, row_values: list, sheet_row: int) -> None:
     )
 
 
-EXTRA_COLS = ["Company Comments", "Match Level", "Missing Skills", "CV Version"]
+EXTRA_COLS = ["Company Comments", "Match Level", "Missing Skills"]
 
 def ensure_extra_cols(ws) -> dict:
-    """Ensures Company Comments, Match Level, Missing Skills, and CV Version columns
-    exist. Returns dict of column_name → 1-based index."""
+    """Ensures Company Comments, Match Level, and Missing Skills columns exist,
+    auto-appending any that are missing at the end of the header row. CV Version and
+    Source are NOT in this list — both sit at a fixed position that append_job's
+    row_values relies on positionally, so (like Source already did) CV Version must
+    already exist in the sheet's header at column M — see the README's sheet-setup
+    section — rather than being auto-appended at the end like these trailing columns.
+    Returns dict of column_name → 1-based index."""
     header = ws.row_values(1)
     indices = {}
     next_col = len([h for h in header if h.strip()]) + 1
@@ -744,6 +759,87 @@ def ensure_extra_cols(ws) -> dict:
             header.append(name)  # keep header in sync for subsequent lookups
 
     return indices
+
+
+CV_VERSIONS_SHEET_NAME = "_cv_versions"
+CV_VERSIONS_HEADER = ["name"]
+
+
+def _cv_versions_store_ws():
+    """Lazily creates a hidden tab to persist custom CV Version names — same pattern as
+    the _app_sessions tab used for login tokens below. Deliberately its own tab rather
+    than reading the per-year sheets' CV Version column: that column already carries a
+    lot of one-off historical filenames (pre-dating this dropdown) that would clutter
+    it with near-duplicates."""
+    base_ws = get_worksheet()  # any worksheet, just to get a handle on the spreadsheet
+    sh = base_ws.spreadsheet
+    try:
+        return sh.worksheet(CV_VERSIONS_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=CV_VERSIONS_SHEET_NAME, rows=200, cols=1)
+        ws.update([CV_VERSIONS_HEADER], "A1")
+        sh.batch_update({
+            "requests": [{
+                "updateSheetProperties": {
+                    "properties": {"sheetId": ws.id, "hidden": True},
+                    "fields": "hidden",
+                }
+            }]
+        })
+        return ws
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_known_cv_versions() -> list[str]:
+    """CV Version dropdown options: DEFAULT_CV_VERSIONS plus any custom name saved via
+    _remember_cv_version. Cached briefly since it's a sheet read on every Add Job
+    render; a value picked earlier in the current session is unioned in separately at
+    render time (see _cv_version_picker) so it shows up immediately rather than
+    waiting out the cache."""
+    try:
+        saved = [v.strip() for v in _cv_versions_store_ws().col_values(1)[1:] if v.strip()]
+    except Exception:
+        saved = []
+    return sorted(set(DEFAULT_CV_VERSIONS) | set(saved))
+
+
+def _remember_cv_version(name: str) -> None:
+    """Persists a newly-typed CV Version so the dropdown offers it from now on,
+    including in future sessions. No-op if it's already a known option; failures are
+    swallowed since this is a convenience — the row itself is already saved either way."""
+    if not name or name in get_known_cv_versions():
+        return
+    try:
+        _cv_versions_store_ws().append_row([name], value_input_option="RAW")
+        get_known_cv_versions.clear()
+    except Exception:
+        pass
+
+
+def _cv_version_picker(key: str) -> str:
+    """Renders the CV Version dropdown (seeded from DEFAULT_CV_VERSIONS + any saved
+    custom names, plus anything picked earlier this session) with an "Enter new
+    version..." choice that reveals a text input — same pattern as the Source/"Other"
+    picker above. Must be called OUTSIDE any st.form: a form's own widgets don't rerun
+    on change, so a dropdown inside one couldn't reactively reveal the text input in
+    reaction to the "Enter new version..." choice."""
+    known = set(get_known_cv_versions()) | st.session_state.get("cv_versions_seen", set())
+    last = st.session_state.get("cv_version", "")
+    if last:
+        known.add(last)
+    options = sorted(known) + [NEW_CV_VERSION]
+    default_idx = options.index(last) if last in options else 0
+    choice = st.selectbox(
+        "CV Version", options, index=default_idx, key=f"cv_version_select_{key}",
+        help="Which CV file/variant you used — pick 'Enter new version...' to add "
+             "one not listed yet; it'll be remembered for future submissions.",
+    )
+    if choice == NEW_CV_VERSION:
+        return st.text_input(
+            "New CV Version name", placeholder="e.g. Mehdi_Mokhtari_CV_Growth",
+            key=f"cv_version_new_{key}",
+        ).strip()
+    return choice
 
 
 def get_all_jobs(ws) -> list:
@@ -933,11 +1029,11 @@ def append_job(data: dict, sheet_name: str | None = None) -> int:
         data["company"], data["role"], data["city"],
         data["language_req"], data["key_skills"], data["contact_person"],
         data["url"], data["status"], data["comments"], data["cv_lang"],
-        data.get("source", ""),          # M — Source
-        "",                              # N — Company Comments
-        match_display,                   # O — Match Level
-        data.get("missing_skills", ""),  # P — Missing Skills
-        data.get("cv_version", ""),      # Q — CV Version
+        data.get("cv_version", ""),      # M — CV Version
+        data.get("source", ""),          # N — Source
+        "",                              # O — Company Comments
+        match_display,                   # P — Match Level
+        data.get("missing_skills", ""),  # Q — Missing Skills
     ]
 
     if insert_idx == total_existing:
@@ -1601,11 +1697,16 @@ def main():
             else:
                 source = source_choice
 
-            # Kept outside the form: a form's own widgets don't trigger a rerun until
-            # it's submitted, so a checkbox inside the form can't reactively re-enable
-            # the form's own submit button — checking it would never be "seen" before
-            # the (still-disabled) submit click that would normally deliver it.
+            # Kept outside the form, same reason as the CV Version picker below: a form's
+            # own widgets don't trigger a rerun until it's submitted, so a checkbox inside
+            # the form can't reactively re-enable the form's own submit button — checking
+            # it would never be "seen" before the (still-disabled) submit click that would
+            # normally deliver it.
             proceed = st.checkbox("I know — add anyway") if dup else True
+
+            # Kept outside the form: picking "Enter new version..." needs a rerun to
+            # reveal the text input, which a form's own widgets can't trigger on their own.
+            cv_version = _cv_version_picker("add")
 
             with st.form("job_form"):
                 c1, c2 = st.columns(2)
@@ -1620,12 +1721,6 @@ def main():
                         "CV Language", ["EN", "DE"],
                         index=0 if st.session_state.get("cv_lang", "EN") == "EN" else 1,
                         horizontal=True,
-                    )
-                    cv_version = st.text_input(
-                        "CV Version",
-                        value=st.session_state.get("cv_version", ""),
-                        help="Which CV file/variant you used (e.g. Backend_v2) — "
-                             "lets you later compare interview rates by CV version.",
                     )
 
                 date_applied = st.text_input(
@@ -1688,7 +1783,7 @@ def main():
                             "language_req": lang_req, "key_skills": key_skills,
                             "contact_person": contact, "url": combined_url,
                             "status": status, "comments": comments,
-                            "cv_lang": cv_edit, "cv_version": cv_version.strip(), "source": source,
+                            "cv_lang": cv_edit, "cv_version": cv_version, "source": source,
                             "match_level": match.get("match_level", "") if match else "",
                             "missing_skills": missing_skills,
                             "date_applied": date_applied.strip(),
@@ -1696,7 +1791,10 @@ def main():
                         _mark_submitted(sig)
                         st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet!"
                         st.session_state["cv_lang"] = cv_edit
-                        st.session_state["cv_version"] = cv_version.strip()
+                        st.session_state["cv_version"] = cv_version
+                        if cv_version:
+                            st.session_state.setdefault("cv_versions_seen", set()).add(cv_version)
+                            _remember_cv_version(cv_version)
                         st.session_state["last_source"] = source
                         st.session_state["input_key"] += 1
                         st.session_state.pop("parsed", None)
@@ -1870,6 +1968,10 @@ def main():
             )
 
             if selected_label == ADD_NEW_LABEL:
+                # Kept outside the form, same reason as the Add Job tab's picker: choosing
+                # "Enter new version..." needs a rerun to reveal the text input.
+                new_cv_version = _cv_version_picker("email")
+
                 with st.form("add_from_email_form"):
                     c1, c2 = st.columns(2)
                     with c1:
@@ -1884,11 +1986,6 @@ def main():
 
                     new_comments = st.text_area(
                         "Comments", value=r.get("company_comments", ""), height=120,
-                    )
-                    new_cv_version = st.text_input(
-                        "CV Version",
-                        value=st.session_state.get("cv_version", ""),
-                        help="Which CV file/variant you used for this application.",
                     )
 
                     add_btn = st.form_submit_button(
@@ -1925,12 +2022,15 @@ def main():
                                 "language_req": "", "key_skills": "", "contact_person": new_contact,
                                 "url": "", "status": "Applied", "comments": new_comments,
                                 "cv_lang": st.session_state.get("cv_lang", "EN"),
-                                "cv_version": new_cv_version.strip(), "source": "Other",
+                                "cv_version": new_cv_version, "source": "Other",
                                 "match_level": "", "missing_skills": "",
                                 "date_applied": new_date.strip(),
                             }, sheet_name=target_sheet)
                             _mark_submitted(sig)
-                            st.session_state["cv_version"] = new_cv_version.strip()
+                            st.session_state["cv_version"] = new_cv_version
+                            if new_cv_version:
+                                st.session_state.setdefault("cv_versions_seen", set()).add(new_cv_version)
+                                _remember_cv_version(new_cv_version)
                             sheet_note = f" ({target_sheet} sheet)" if target_sheet else ""
                             st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet{sheet_note}!"
                             st.session_state.pop("email_parsed", None)
