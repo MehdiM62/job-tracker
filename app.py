@@ -846,8 +846,8 @@ def get_all_jobs(ws) -> list:
     return ws.get_all_records()
 
 
-def find_duplicate(ws, url: str, company: str, role: str) -> dict | None:
-    for rec in get_all_jobs(ws):
+def find_duplicate_in_records(records: list, url: str, company: str, role: str) -> dict | None:
+    for rec in records:
         if url and rec.get("Job URL", "").strip() == url.strip():
             return rec
         if (company and role
@@ -855,6 +855,10 @@ def find_duplicate(ws, url: str, company: str, role: str) -> dict | None:
                 and rec.get("Role", "").strip().lower() == role.strip().lower()):
             return rec
     return None
+
+
+def find_duplicate(ws, url: str, company: str, role: str) -> dict | None:
+    return find_duplicate_in_records(get_all_jobs(ws), url, company, role)
 
 
 ROW_BASE_PX = 5
@@ -1193,7 +1197,7 @@ def _save_fetch_snapshot() -> None:
     store = _fetch_result_store()
     store.clear()
     for key in ("parsed", "job_url", "cv_lang", "match_result", "match_error",
-                "profile_loaded", "parse_used_fallback", "duplicate"):
+                "profile_loaded", "parse_used_fallback", "duplicate", "dupcheck_failed"):
         if key in st.session_state:
             store[key] = st.session_state[key]
     store["saved_at"] = time.time()
@@ -1219,6 +1223,55 @@ def _restore_fetch_snapshot_if_needed() -> None:
         if key != "saved_at":
             st.session_state[key] = value
     st.session_state["restored_from_recovery"] = True
+
+
+# Same cross-session recovery pattern as above, for the Update from Email tab: its
+# email_parsed/email_jobs/email_target_sheet lived only in st.session_state with no
+# snapshot at all, so the exact same mobile session eviction that Fetch & Parse is
+# protected against would instead silently drop an already-parsed result, forcing a
+# re-parse — one of this app's actual reported symptoms on mobile. This only covers
+# a result that finished parsing; a session dying between pasting the email and
+# clicking Parse loses the pasted text itself the same way the Add Job tab's own
+# pre-parse text does — there's no server-side result yet at that point for either
+# tab to snapshot.
+
+EMAIL_RESULT_TTL_SECONDS = 30 * 60
+
+
+@st.cache_resource
+def _email_result_store() -> dict:
+    return {}
+
+
+def _save_email_snapshot() -> None:
+    store = _email_result_store()
+    store.clear()
+    for key in ("email_parsed", "email_jobs", "email_target_sheet", "email_used_fallback"):
+        if key in st.session_state:
+            store[key] = st.session_state[key]
+    store["saved_at"] = time.time()
+
+
+def _clear_email_store() -> None:
+    _email_result_store().clear()
+
+
+def _restore_email_snapshot_if_needed() -> None:
+    """Called on every render of the Update from Email tab. If this session has no
+    parsed email of its own but the process-wide store has a recent one, adopts it —
+    recovering a result that was computed under a session which no longer exists."""
+    if "email_parsed" in st.session_state:
+        return
+    store = _email_result_store()
+    if not store.get("email_parsed"):
+        return
+    if time.time() - store.get("saved_at", 0) > EMAIL_RESULT_TTL_SECONDS:
+        store.clear()
+        return
+    for key, value in store.items():
+        if key != "saved_at":
+            st.session_state[key] = value
+    st.session_state["email_restored_from_recovery"] = True
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -1551,6 +1604,7 @@ def main():
                         st.session_state["job_url"] = _url
                         st.session_state["cv_lang"] = _cv_lang
                         st.session_state.pop("duplicate", None)
+                        st.session_state.pop("dupcheck_failed", None)
                         st.session_state.pop("match_result", None)
                         st.session_state.pop("match_error", None)
                     except json.JSONDecodeError:
@@ -1584,18 +1638,31 @@ def main():
             elif stage == "dupcheck":
                 parsed = st.session_state.get("parsed", {})
                 with st.spinner("Checking for duplicates..."):
-                    try:
-                        ws = get_worksheet()
-                        dup = find_duplicate(
-                            ws,
-                            st.session_state.get("job_url", ""),
-                            parsed.get("company", ""),
-                            parsed.get("role", ""),
-                        )
-                        if dup:
-                            st.session_state["duplicate"] = dup
-                    except Exception:
-                        pass  # Don't block on duplicate check failure
+                    # Retried rather than silently swallowed on the first failure: a mobile
+                    # connection dropping mid-request used to make this look clean (no
+                    # warning shown) even though the check never actually ran, and the user
+                    # would then re-submit a genuine duplicate with nothing telling them to
+                    # check first. If every attempt fails, dupcheck_failed says so instead
+                    # of pretending the sheet is clear.
+                    dup = None
+                    dupcheck_failed = True
+                    for attempt in range(3):
+                        try:
+                            ws = get_worksheet()
+                            dup = find_duplicate(
+                                ws,
+                                st.session_state.get("job_url", ""),
+                                parsed.get("company", ""),
+                                parsed.get("role", ""),
+                            )
+                            dupcheck_failed = False
+                            break
+                        except Exception:
+                            if attempt < 2:
+                                time.sleep(1.5 * (attempt + 1))
+                    if dup:
+                        st.session_state["duplicate"] = dup
+                    st.session_state["dupcheck_failed"] = dupcheck_failed
                 _save_fetch_snapshot()
                 st.session_state["fetch_stage"] = None
                 st.rerun()
@@ -1620,6 +1687,11 @@ def main():
                     f"(row #{dup.get('No.')}, applied {dup.get('Date Applied')}, "
                     f"status: {dup.get('Status')})."
                 )
+            elif st.session_state.get("dupcheck_failed"):
+                st.warning(
+                    "⚠️ **Could not check for duplicates** (connection issue) — double-check "
+                    "you haven't already applied to this job before submitting."
+                )
 
             col_review, col_discard = st.columns([5, 1])
             with col_review:
@@ -1628,6 +1700,7 @@ def main():
                 if st.button("✖️ Discard", help="Clear this result without saving"):
                     st.session_state.pop("parsed", None)
                     st.session_state.pop("duplicate", None)
+                    st.session_state.pop("dupcheck_failed", None)
                     st.session_state.pop("match_result", None)
                     st.session_state.pop("match_error", None)
                     _clear_fetch_store()
@@ -1773,6 +1846,7 @@ def main():
                     st.session_state["input_key"] += 1
                     st.session_state.pop("parsed", None)
                     st.session_state.pop("duplicate", None)
+                    st.session_state.pop("dupcheck_failed", None)
                     st.session_state["adding_job"] = False
                     st.rerun()
 
@@ -1799,6 +1873,7 @@ def main():
                         st.session_state["input_key"] += 1
                         st.session_state.pop("parsed", None)
                         st.session_state.pop("duplicate", None)
+                        st.session_state.pop("dupcheck_failed", None)
                         _clear_fetch_store()
                         st.session_state["adding_job"] = False
                         st.rerun()
@@ -1817,6 +1892,8 @@ def main():
     with tab_email:
         st.subheader("Update application status from an email")
         st.caption("Paste an email you received from a recruiter or company — the AI will identify the job and extract key information.")
+
+        _restore_email_snapshot_if_needed()
 
         ek = st.session_state["email_key"]
         email_text = st.text_area(
@@ -1882,6 +1959,7 @@ def main():
             st.session_state["email_target_sheet"] = target_sheet
 
             st.session_state["parsing_email"] = False
+            _save_email_snapshot()
             st.rerun()
 
         if "email_parsed" in st.session_state:
@@ -1891,6 +1969,11 @@ def main():
 
             st.divider()
             st.subheader("Review & Apply Update")
+            if st.session_state.pop("email_restored_from_recovery", False):
+                st.info(
+                    "↩️ Restored your last **Parse Email** result — the page must have "
+                    "reloaded (e.g. the browser tab was backgrounded) before you could see it."
+                )
             if target_sheet:
                 st.caption(f"📁 This email is dated {ARCHIVE_SHEET_YEAR} — matching against the **{target_sheet}** sheet tab.")
             if st.session_state.get("email_used_fallback"):
@@ -1968,7 +2051,29 @@ def main():
             )
 
             if selected_label == ADD_NEW_LABEL:
-                # Kept outside the form, same reason as the Add Job tab's picker: choosing
+                # Checked against the jobs list already fetched for this parse (no extra
+                # Sheets call, so nothing here can fail on a flaky connection). Same class
+                # of protection as the Add Job tab's dupcheck stage: reprocessing the same
+                # "new application" email twice (e.g. after a lost mobile session made the
+                # first submission look like it hadn't gone through) used to silently create
+                # an exact duplicate row, since this path never checked for one before
+                # inserting.
+                email_dup = find_duplicate_in_records(
+                    jobs, "", r.get("matched_company", ""), r.get("matched_role", ""),
+                )
+                if email_dup:
+                    st.warning(
+                        f"⚠️ **Possible duplicate** — you may have already applied to "
+                        f"**{email_dup.get('Company')}** for **{email_dup.get('Role')}** "
+                        f"(row #{email_dup.get('No.')}, applied {email_dup.get('Date Applied')}, "
+                        f"status: {email_dup.get('Status')})."
+                    )
+                # Kept outside the form, same reason as the Add Job tab's own "add anyway"
+                # checkbox: a form's own widgets don't rerun on change, so a checkbox inside
+                # the form couldn't reactively re-enable the submit button below.
+                email_dup_proceed = st.checkbox("I know — add anyway") if email_dup else True
+
+                # Kept outside the form, same reason as the CV Version picker below: choosing
                 # "Enter new version..." needs a rerun to reveal the text input.
                 new_cv_version = _cv_version_picker("email")
 
@@ -1990,7 +2095,7 @@ def main():
 
                     add_btn = st.form_submit_button(
                         "➕ Add to Google Sheet", type="primary", use_container_width=True,
-                        disabled=st.session_state.get("adding_from_email", False),
+                        disabled=not email_dup_proceed or st.session_state.get("adding_from_email", False),
                     )
 
                 if add_btn:
@@ -2013,6 +2118,7 @@ def main():
                         st.session_state.pop("email_target_sheet", None)
                         st.session_state["email_key"] += 1
                         st.session_state["adding_from_email"] = False
+                        _clear_email_store()
                         st.rerun()
 
                     with st.spinner("Adding to Google Sheet..."):
@@ -2038,6 +2144,7 @@ def main():
                             st.session_state.pop("email_target_sheet", None)
                             st.session_state["email_key"] += 1
                             st.session_state["adding_from_email"] = False
+                            _clear_email_store()
                             st.rerun()
                         except Exception as e:
                             _flash("error", f"Failed to add: {e}")
@@ -2110,6 +2217,23 @@ def main():
                     st.rerun()
 
                 if st.session_state.get("updating_sheet"):
+                    # Same double-submit guard as the other two submission paths in this
+                    # app — previously missing here, so an impatient second tap (or a
+                    # click that looked like it didn't register on a slow connection)
+                    # could append the same Company Comments entry to the row twice.
+                    sig = ("update_from_email", selected_row_no, new_status,
+                           company_comments.strip(), email_date.strip())
+                    if _is_duplicate_submission(sig):
+                        st.session_state["success_msg"] = "Already applied that update — skipped a duplicate submission."
+                        st.session_state.pop("email_parsed", None)
+                        st.session_state.pop("email_jobs", None)
+                        st.session_state.pop("email_target_sheet", None)
+                        st.session_state.pop("email_backfill_overrides", None)
+                        st.session_state["email_key"] += 1
+                        st.session_state["updating_sheet"] = False
+                        _clear_email_store()
+                        st.rerun()
+
                     with st.spinner("Updating sheet..."):
                         try:
                             email_info = dict(r)
@@ -2119,6 +2243,7 @@ def main():
                                 sheet_name=target_sheet, email_info=email_info,
                             )
                             if ok:
+                                _mark_submitted(sig)
                                 sheet_note = f" ({target_sheet} sheet)" if target_sheet else ""
                                 fill_note = f" — also filled in {', '.join(filled_fields)}" if filled_fields else ""
                                 st.session_state["success_msg"] = (
@@ -2130,6 +2255,7 @@ def main():
                                 st.session_state.pop("email_backfill_overrides", None)
                                 st.session_state["email_key"] += 1  # clears email text area
                                 st.session_state["updating_sheet"] = False
+                                _clear_email_store()
                                 st.rerun()
                             else:
                                 _flash("error", f"Row #{selected_row_no} not found in the sheet.")
