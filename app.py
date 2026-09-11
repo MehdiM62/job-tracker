@@ -659,6 +659,14 @@ def _open_spreadsheet():
             )
         creds = Credentials.from_service_account_file(path, scopes=SCOPES)
     gc = gspread.authorize(creds)
+    # gspread's default is no timeout at all (blocks forever on a stalled connection) —
+    # confirmed live as the cause of "stuck in Matching..."/"stuck in Saving..." reports
+    # on mobile: a stalled request during a Sheets read/write just hung indefinitely
+    # instead of failing so the existing retry/recovery logic could act on it. This
+    # timeout applies to every call made through this client (every worksheet obtained
+    # from it shares the same http_client), so nothing sheet-related can hang forever
+    # again — a genuinely slow-but-alive connection still has 30s per request to finish.
+    gc.http_client.set_timeout(30)
     return gc.open_by_key(SHEET_ID)
 
 
@@ -994,103 +1002,160 @@ def _flash(kind: str, text: str) -> None:
     st.session_state["flash"] = (kind, text)
 
 
+APPEND_JOB_DEDUP_WINDOW_DAYS = 3  # same value gmail_bulk.py's own final safety net uses
+
+
+class DuplicateRowError(Exception):
+    """Raised by append_job() when its own final, immediately-pre-insert check finds a
+    near-identical row already on the sheet. Carries that row's own "No." so the caller
+    can report "already there" instead of silently creating a second copy or bubbling
+    up as a generic write failure."""
+    def __init__(self, existing_no):
+        self.existing_no = existing_no
+        super().__init__(f"Already in the sheet as row #{existing_no} — no new row created.")
+
+
+@st.cache_resource
+def _append_job_lock():
+    """Process-wide (not per-session) lock serializing append_job()'s check-then-create
+    step — same pattern, and the same reason, as gmail_bulk.py's _new_application_lock.
+    Without it, two concurrent attempts for the same application (a session recovered
+    after a mobile disconnect resubmitting an already-reviewed job, or this account
+    open on two devices at once) could each read the sheet, see no existing row yet,
+    and both insert one moments apart."""
+    import threading
+    return threading.Lock()
+
+
 def append_job(data: dict, sheet_name: str | None = None) -> int:
     """Inserts the job at the sheet position that keeps Date Applied ascending —
     appends at the bottom if the date is newest (the common case), otherwise inserts
     in the middle and renumbers every row pushed down so No. stays sequential.
     sheet_name targets a specific tab (e.g. the "2025" archive); omitted keeps the
-    existing default of the current-year sheet1."""
+    existing default of the current-year sheet1.
+
+    Raises DuplicateRowError instead of inserting if a near-identical row (same URL,
+    or same normalized company+role within APPEND_JOB_DEDUP_WINDOW_DAYS) already
+    exists. The review form's own duplicate warning (find_duplicate, shown once before
+    the user ever clicks Add) and the per-session double-submit guard (_is_duplicate_
+    submission) both live in st.session_state, which is exactly what a mobile session
+    eviction wipes — a recovered session resubmitting that same reviewed job sails
+    straight through both. Confirmed live: an "Add to Google Sheet" that looked stuck/
+    slow, retried from a recovered session, produced several duplicate rows for the
+    same application. This is the one check that's both always-run (every call, no
+    matter how it was triggered) and safe from that same session loss, since it reads
+    the live sheet itself rather than anything cached in a session."""
     ws = get_worksheet(sheet_name)
     ensure_extra_cols(ws)
-    all_rows = ws.get_all_values()
-    data_rows = [r for r in all_rows[1:] if any(cell.strip() for cell in r)]
-    total_existing = len(data_rows)
 
-    date_str = data.get("date_applied") or datetime.now(CET).strftime("%Y-%m-%d %H:%M")
-    try:
-        new_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
-    except ValueError:
-        date_str = datetime.now(CET).strftime("%Y-%m-%d %H:%M")
-        new_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+    with _append_job_lock():
+        all_rows = ws.get_all_values()
+        data_rows = [r for r in all_rows[1:] if any(cell.strip() for cell in r)]
+        total_existing = len(data_rows)
 
-    insert_idx = total_existing
-    for i, row in enumerate(data_rows):
+        date_str = data.get("date_applied") or datetime.now(CET).strftime("%Y-%m-%d %H:%M")
         try:
-            existing_dt = datetime.strptime(row[1], "%Y-%m-%d %H:%M")
-        except (ValueError, IndexError):
-            continue
-        if new_dt < existing_dt:
-            insert_idx = i
-            break
+            new_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            date_str = datetime.now(CET).strftime("%Y-%m-%d %H:%M")
+            new_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
 
-    new_no = insert_idx + 1
-    sheet_row = insert_idx + 2  # +1 for header, +1 for 1-indexing
-
-    ml = data.get("match_level", "")
-    match_display = f"{ml}%" if isinstance(ml, int) else str(ml)
-    row_values = [
-        new_no, date_str,
-        data["company"], data["role"], data["city"],
-        data["language_req"], data["key_skills"], data["contact_person"],
-        data["url"], data["status"], data["comments"], data["cv_lang"],
-        data.get("cv_version", ""),      # M — CV Version
-        data.get("source", ""),          # N — Source
-        "",                              # O — Company Comments
-        match_display,                   # P — Match Level
-        data.get("missing_skills", ""),  # Q — Missing Skills
-    ]
-
-    if insert_idx == total_existing:
-        # A single atomic API call (values.append) — no partial-failure risk, safe to
-        # retry as one unit if it's ever rejected outright.
-        _with_sheets_retry(ws.append_row, row_values, value_input_option="USER_ENTERED")
-    else:
-        # NOT ws.insert_row() — see _insert_row_with_values's docstring for the real
-        # incident (permanently blank rows) that came from trusting it as one call.
-        _insert_row_with_values(ws, row_values, sheet_row)
-        renumber_range = f"A{sheet_row + 1}:A{sheet_row + (total_existing - insert_idx)}"
-        # Bumped values come from data_rows — the SAME read taken at the top of this
-        # call, before this insert — rather than re-reading the range after the insert.
-        # A re-read here used to be able to race a Sheets consistency lag when several
-        # append_job() calls fire back-to-back in a bulk-apply batch (confirmed live:
-        # this produced duplicate/misaligned No. values across dozens of rows). The
-        # pushed-down rows' own prior No. values are already known from that first
-        # read, so there's nothing to gain from reading them again.
-        bumped = [
-            [str(int(data_rows[i][0]) + 1)]
-            for i in range(insert_idx, total_existing)
-            if data_rows[i] and data_rows[i][0].strip().isdigit()
-        ]
-        if bumped:
+        target_url = (data.get("url") or "").strip()
+        target_co = normalize_company(data.get("company", ""))
+        target_role = normalize_role(data.get("role", ""))
+        for row in data_rows:
+            row_url = row[8].strip() if len(row) > 8 else ""
+            same_url = bool(target_url) and row_url == target_url
+            same_co_role = bool(target_co and target_role
+                                 and normalize_company(row[2] if len(row) > 2 else "") == target_co
+                                 and normalize_role(row[3] if len(row) > 3 else "") == target_role)
+            if not (same_url or same_co_role):
+                continue
             try:
-                # USER_ENTERED (not RAW) so a bumped "No." lands as a real number, the
-                # same as it would if typed into the sheet — RAW here used to store it
-                # as plain text instead, leaving No. cells inconsistently typed (some
-                # numbers, some text) depending on whether a row had ever been bumped
-                # by a later backdated insert.
-                _with_sheets_retry(ws.update, bumped, renumber_range, value_input_option="USER_ENTERED")
-            except Exception:
-                # The new row itself is already safely inserted with the correct data
-                # and its own correct new_no — only the OTHER rows pushed down by it
-                # didn't get their numbers bumped. Confirmed live via the Email Import
-                # Log: this exception propagating used to make the caller think the
-                # entire operation failed, when the actual application data had
-                # already been written — the message never got logged as processed,
-                # and the row was still there (with no way to tell it apart from a
-                # genuine failure) if the same email got processed again. A stale
-                # number is a cosmetic issue fixable with a later renumber pass; losing
-                # track of whether this email was already applied is a worse one.
-                pass
+                existing_dt = datetime.strptime(row[1], "%Y-%m-%d %H:%M")
+            except (ValueError, IndexError):
+                continue
+            if abs((new_dt - existing_dt).days) <= APPEND_JOB_DEDUP_WINDOW_DAYS:
+                raise DuplicateRowError(row[0])
 
-    try:
-        format_row(ws, sheet_row, [data["key_skills"], data["comments"], data.get("missing_skills", "")])
-    except Exception:
-        # Formatting is cosmetic — the row's actual data is already safely written
-        # above. Letting a formatting hiccup fail this whole call would report a
-        # successful write as "failed", which is exactly what pushed a user to
-        # manually retry and create a genuine duplicate row in a real incident.
-        pass
-    return new_no
+        insert_idx = total_existing
+        for i, row in enumerate(data_rows):
+            try:
+                existing_dt = datetime.strptime(row[1], "%Y-%m-%d %H:%M")
+            except (ValueError, IndexError):
+                continue
+            if new_dt < existing_dt:
+                insert_idx = i
+                break
+
+        new_no = insert_idx + 1
+        sheet_row = insert_idx + 2  # +1 for header, +1 for 1-indexing
+
+        ml = data.get("match_level", "")
+        match_display = f"{ml}%" if isinstance(ml, int) else str(ml)
+        row_values = [
+            new_no, date_str,
+            data["company"], data["role"], data["city"],
+            data["language_req"], data["key_skills"], data["contact_person"],
+            data["url"], data["status"], data["comments"], data["cv_lang"],
+            data.get("cv_version", ""),      # M — CV Version
+            data.get("source", ""),          # N — Source
+            "",                              # O — Company Comments
+            match_display,                   # P — Match Level
+            data.get("missing_skills", ""),  # Q — Missing Skills
+        ]
+
+        if insert_idx == total_existing:
+            # A single atomic API call (values.append) — no partial-failure risk, safe to
+            # retry as one unit if it's ever rejected outright.
+            _with_sheets_retry(ws.append_row, row_values, value_input_option="USER_ENTERED")
+        else:
+            # NOT ws.insert_row() — see _insert_row_with_values's docstring for the real
+            # incident (permanently blank rows) that came from trusting it as one call.
+            _insert_row_with_values(ws, row_values, sheet_row)
+            renumber_range = f"A{sheet_row + 1}:A{sheet_row + (total_existing - insert_idx)}"
+            # Bumped values come from data_rows — the SAME read taken at the top of this
+            # call, before this insert — rather than re-reading the range after the insert.
+            # A re-read here used to be able to race a Sheets consistency lag when several
+            # append_job() calls fire back-to-back in a bulk-apply batch (confirmed live:
+            # this produced duplicate/misaligned No. values across dozens of rows). The
+            # pushed-down rows' own prior No. values are already known from that first
+            # read, so there's nothing to gain from reading them again.
+            bumped = [
+                [str(int(data_rows[i][0]) + 1)]
+                for i in range(insert_idx, total_existing)
+                if data_rows[i] and data_rows[i][0].strip().isdigit()
+            ]
+            if bumped:
+                try:
+                    # USER_ENTERED (not RAW) so a bumped "No." lands as a real number, the
+                    # same as it would if typed into the sheet — RAW here used to store it
+                    # as plain text instead, leaving No. cells inconsistently typed (some
+                    # numbers, some text) depending on whether a row had ever been bumped
+                    # by a later backdated insert.
+                    _with_sheets_retry(ws.update, bumped, renumber_range, value_input_option="USER_ENTERED")
+                except Exception:
+                    # The new row itself is already safely inserted with the correct data
+                    # and its own correct new_no — only the OTHER rows pushed down by it
+                    # didn't get their numbers bumped. Confirmed live via the Email Import
+                    # Log: this exception propagating used to make the caller think the
+                    # entire operation failed, when the actual application data had
+                    # already been written — the message never got logged as processed,
+                    # and the row was still there (with no way to tell it apart from a
+                    # genuine failure) if the same email got processed again. A stale
+                    # number is a cosmetic issue fixable with a later renumber pass; losing
+                    # track of whether this email was already applied is a worse one.
+                    pass
+
+        try:
+            format_row(ws, sheet_row, [data["key_skills"], data["comments"], data.get("missing_skills", "")])
+        except Exception:
+            # Formatting is cosmetic — the row's actual data is already safely written
+            # above. Letting a formatting hiccup fail this whole call would report a
+            # successful write as "failed", which is exactly what pushed a user to
+            # manually retry and create a genuine duplicate row in a real incident.
+            pass
+        return new_no
 
 
 def _is_blank_field(value) -> bool:
@@ -1194,10 +1259,19 @@ def _fetch_result_store() -> dict:
 
 
 def _save_fetch_snapshot() -> None:
+    """Call sites set st.session_state["fetch_stage"] to the NEXT stage to run (or
+    None once dupcheck is done) BEFORE calling this — it's snapshotted as part of the
+    same dict specifically so a recovered session resumes the multi-stage pipeline
+    from wherever it actually got to, rather than only ever recovering a fully-
+    finished parse. Without this, a session dying mid-"match" or mid-"dupcheck" (both
+    real, live-confirmed cases — not just mid-"parse") looked stuck forever: the
+    parsed result WAS in the store, but with no stage to resume into, a fresh session
+    just rendered an incomplete review form frozen mid-pipeline instead of finishing it."""
     store = _fetch_result_store()
     store.clear()
     for key in ("parsed", "job_url", "cv_lang", "match_result", "match_error",
-                "profile_loaded", "parse_used_fallback", "duplicate", "dupcheck_failed"):
+                "profile_loaded", "parse_used_fallback", "duplicate", "dupcheck_failed",
+                "fetch_stage"):
         if key in st.session_state:
             store[key] = st.session_state[key]
     store["saved_at"] = time.time()
@@ -1710,8 +1784,8 @@ def main():
                         st.session_state["fetch_stage"] = None
                         _clear_pending_fetch_input()
                         st.rerun()
-                _save_fetch_snapshot()  # also clears any pending_* input markers (store.clear())
                 st.session_state["fetch_stage"] = "match"
+                _save_fetch_snapshot()  # also clears any pending_* input markers (store.clear())
                 st.rerun()
 
             elif stage == "match":
@@ -1726,8 +1800,8 @@ def main():
                         except Exception as e:
                             st.session_state["match_error"] = str(e)
                 st.session_state["parse_used_fallback"] = "groq" in st.session_state.get("llm_providers_used", [])
-                _save_fetch_snapshot()
                 st.session_state["fetch_stage"] = "dupcheck"
+                _save_fetch_snapshot()
                 st.rerun()
 
             elif stage == "dupcheck":
@@ -1758,8 +1832,8 @@ def main():
                     if dup:
                         st.session_state["duplicate"] = dup
                     st.session_state["dupcheck_failed"] = dupcheck_failed
-                _save_fetch_snapshot()
                 st.session_state["fetch_stage"] = None
+                _save_fetch_snapshot()
                 st.rerun()
 
         # ── Review form ───────────────────────────────────────────────────────
@@ -1964,6 +2038,21 @@ def main():
                         if cv_version:
                             st.session_state.setdefault("cv_versions_seen", set()).add(cv_version)
                             _remember_cv_version(cv_version)
+                        st.session_state["last_source"] = source
+                        st.session_state["input_key"] += 1
+                        st.session_state.pop("parsed", None)
+                        st.session_state.pop("duplicate", None)
+                        st.session_state.pop("dupcheck_failed", None)
+                        _clear_fetch_store()
+                        st.session_state["adding_job"] = False
+                        st.rerun()
+                    except DuplicateRowError as e:
+                        _mark_submitted(sig)
+                        st.session_state["success_msg"] = (
+                            f"✅ Already in the sheet as row #{e.existing_no} — didn't create a duplicate."
+                        )
+                        st.session_state["cv_lang"] = cv_edit
+                        st.session_state["cv_version"] = cv_version
                         st.session_state["last_source"] = source
                         st.session_state["input_key"] += 1
                         st.session_state.pop("parsed", None)
@@ -2239,6 +2328,19 @@ def main():
                                 _remember_cv_version(new_cv_version)
                             sheet_note = f" ({target_sheet} sheet)" if target_sheet else ""
                             st.session_state["success_msg"] = f"🎉 Row #{row_no} added to Google Sheet{sheet_note}!"
+                            st.session_state.pop("email_parsed", None)
+                            st.session_state.pop("email_jobs", None)
+                            st.session_state.pop("email_target_sheet", None)
+                            st.session_state["email_key"] += 1
+                            st.session_state["adding_from_email"] = False
+                            _clear_email_store()
+                            st.rerun()
+                        except DuplicateRowError as e:
+                            _mark_submitted(sig)
+                            st.session_state["success_msg"] = (
+                                f"✅ Already in the sheet as row #{e.existing_no} — didn't create a duplicate."
+                            )
+                            st.session_state["cv_version"] = new_cv_version
                             st.session_state.pop("email_parsed", None)
                             st.session_state.pop("email_jobs", None)
                             st.session_state.pop("email_target_sheet", None)
