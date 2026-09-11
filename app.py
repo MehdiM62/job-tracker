@@ -2049,7 +2049,8 @@ def main():
                     except DuplicateRowError as e:
                         _mark_submitted(sig)
                         st.session_state["success_msg"] = (
-                            f"✅ Already in the sheet as row #{e.existing_no} — didn't create a duplicate."
+                            f"✅ This was already saved as row #{e.existing_no} (most likely from just before "
+                            f"the app restarted/reconnected) — skipped so it wouldn't be added twice."
                         )
                         st.session_state["cv_lang"] = cv_edit
                         st.session_state["cv_version"] = cv_version
@@ -2338,7 +2339,8 @@ def main():
                         except DuplicateRowError as e:
                             _mark_submitted(sig)
                             st.session_state["success_msg"] = (
-                                f"✅ Already in the sheet as row #{e.existing_no} — didn't create a duplicate."
+                                f"✅ This was already saved as row #{e.existing_no} (most likely from just before "
+                                f"the app restarted/reconnected) — skipped so it wouldn't be added twice."
                             )
                             st.session_state["cv_version"] = new_cv_version
                             st.session_state.pop("email_parsed", None)
