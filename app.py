@@ -1279,11 +1279,7 @@ def _restore_fetch_snapshot_if_needed() -> None:
 # email_parsed/email_jobs/email_target_sheet lived only in st.session_state with no
 # snapshot at all, so the exact same mobile session eviction that Fetch & Parse is
 # protected against would instead silently drop an already-parsed result, forcing a
-# re-parse — one of this app's actual reported symptoms on mobile. This only covers
-# a result that finished parsing; a session dying between pasting the email and
-# clicking Parse loses the pasted text itself the same way the Add Job tab's own
-# pre-parse text does — there's no server-side result yet at that point for either
-# tab to snapshot.
+# re-parse — one of this app's actual reported symptoms on mobile.
 
 EMAIL_RESULT_TTL_SECONDS = 30 * 60
 
@@ -1322,6 +1318,48 @@ def _restore_email_snapshot_if_needed() -> None:
         if key != "saved_at":
             st.session_state[key] = value
     st.session_state["email_restored_from_recovery"] = True
+
+
+# Same "pending input, snapshotted before the slow work starts" fix as Add Job's
+# _save_pending_fetch_input above: _save_email_snapshot only captures a FINISHED parse.
+# A tab backgrounded long enough to get its session evicted while extract_email_info()
+# (the slow AI call) is still running has nothing snapshotted yet — the review looked
+# permanently stuck on "Parsing email with AI...", and if the session was gone for
+# good, the pasted email itself was gone too.
+
+def _save_pending_email_input() -> None:
+    store = _email_result_store()
+    store["pending_email_text"] = st.session_state.get("pending_email_text", "")
+    store["pending_email_saved_at"] = time.time()
+
+
+def _clear_pending_email_input() -> None:
+    store = _email_result_store()
+    store.pop("pending_email_text", None)
+    store.pop("pending_email_saved_at", None)
+
+
+def _resume_pending_email_if_needed() -> None:
+    """Called on every render of the Update from Email tab, right alongside
+    _restore_email_snapshot_if_needed. If this session has no parse in progress or
+    completed, but the store still has pending email text that was never followed by a
+    finished parse, re-launches Parse Email with that same text automatically."""
+    if "email_parsed" in st.session_state or st.session_state.get("parsing_email"):
+        return
+    store = _email_result_store()
+    pending_text = store.get("pending_email_text")
+    if not pending_text:
+        return
+    if time.time() - store.get("pending_email_saved_at", 0) > EMAIL_RESULT_TTL_SECONDS:
+        _clear_pending_email_input()
+        return
+    st.session_state["pending_email_text"] = pending_text
+    st.session_state["parsing_email"] = True
+    _clear_pending_email_input()
+    st.info(
+        "↩️ Resuming your last **Parse Email** — the connection must have dropped "
+        "(e.g. the browser tab was backgrounded) before it could finish."
+    )
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -1951,6 +1989,7 @@ def main():
         st.caption("Paste an email you received from a recruiter or company — the AI will identify the job and extract key information.")
 
         _restore_email_snapshot_if_needed()
+        _resume_pending_email_if_needed()
 
         ek = st.session_state["email_key"]
         email_text = st.text_area(
@@ -1972,6 +2011,7 @@ def main():
                 st.stop()
             st.session_state["parsing_email"] = True
             st.session_state["pending_email_text"] = email_text.strip()
+            _save_pending_email_input()
             st.rerun()
 
         if st.session_state.get("parsing_email"):
@@ -1985,6 +2025,7 @@ def main():
                 except Exception as e:
                     _flash("error", f"Parsing failed: {e}")
                     st.session_state["parsing_email"] = False
+                    _clear_pending_email_input()
                     st.rerun()
 
             # The email's own date decides which worksheet tab to match/update against —
@@ -2001,10 +2042,12 @@ def main():
                         sheet_label = f"{target_sheet} " if target_sheet else ""
                         _flash("error", f"No job applications found in the {sheet_label}sheet yet.")
                         st.session_state["parsing_email"] = False
+                        _clear_pending_email_input()
                         st.rerun()
                 except Exception as e:
                     _flash("error", f"Could not load sheet: {e}")
                     st.session_state["parsing_email"] = False
+                    _clear_pending_email_input()
                     st.rerun()
 
             result["matched_row"], result["matched_row_candidates"] = fuzzy_find_job(
