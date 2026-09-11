@@ -1207,6 +1207,56 @@ def _clear_fetch_store() -> None:
     _fetch_result_store().clear()
 
 
+# A finished stage snapshot (above) isn't enough on its own — confirmed live: a mobile
+# tab backgrounded long enough gets its session evicted mid-stage (most likely during
+# the several-second AI parse call), before that stage has finished and saved anything.
+# Nothing yet describes what was being attempted, so the user comes back to a session
+# with no memory of it at all and has to retype the URL/description from scratch. This
+# snapshots the raw input the moment Fetch & Parse is clicked — before any slow work —
+# so a fresh session can automatically resume the same attempt instead of just sitting
+# there looking stuck, or losing it outright.
+
+def _save_pending_fetch_input() -> None:
+    store = _fetch_result_store()
+    store["pending_url"] = st.session_state.get("fetch_job_url", "")
+    store["pending_manual_text"] = st.session_state.get("fetch_manual_text", "")
+    store["pending_cv_lang"] = st.session_state.get("fetch_cv_lang", "EN")
+    store["pending_saved_at"] = time.time()
+
+
+def _clear_pending_fetch_input() -> None:
+    store = _fetch_result_store()
+    for key in ("pending_url", "pending_manual_text", "pending_cv_lang", "pending_saved_at"):
+        store.pop(key, None)
+
+
+def _resume_pending_fetch_if_needed() -> None:
+    """Called on every render of the Add Job tab, right alongside
+    _restore_fetch_snapshot_if_needed. If this session has no parse in progress or
+    completed, but the store still has a pending Fetch & Parse input that was never
+    followed by a finished stage, re-launches the same Fetch & Parse attempt with that
+    input rather than leaving the user to notice nothing happened and start over."""
+    if "parsed" in st.session_state or st.session_state.get("fetch_stage"):
+        return
+    store = _fetch_result_store()
+    pending_url = store.get("pending_url")
+    pending_text = store.get("pending_manual_text")
+    if not pending_url and not pending_text:
+        return
+    if time.time() - store.get("pending_saved_at", 0) > FETCH_RESULT_TTL_SECONDS:
+        _clear_pending_fetch_input()
+        return
+    st.session_state["fetch_job_url"] = pending_url
+    st.session_state["fetch_manual_text"] = pending_text
+    st.session_state["fetch_cv_lang"] = store.get("pending_cv_lang", "EN")
+    st.session_state["fetch_stage"] = "fetch_text"
+    _clear_pending_fetch_input()
+    st.info(
+        "↩️ Resuming your last **Fetch & Parse** — the connection must have dropped "
+        "(e.g. the browser tab was backgrounded) before it could finish."
+    )
+
+
 def _restore_fetch_snapshot_if_needed() -> None:
     """Called on every render of the Add Job tab. If this session has no in-progress or
     finished parse of its own but the process-wide store has a recent one, adopts it —
@@ -1515,6 +1565,7 @@ def main():
                         st.rerun()
 
         _restore_fetch_snapshot_if_needed()
+        _resume_pending_fetch_if_needed()
 
         k = st.session_state["input_key"]
 
@@ -1558,6 +1609,7 @@ def main():
             st.session_state["fetch_job_url"] = url.strip()
             st.session_state["fetch_cv_lang"] = cv_lang
             st.session_state["fetch_manual_text"] = manual_text.strip()
+            _save_pending_fetch_input()
             st.rerun()
 
         stage = st.session_state.get("fetch_stage")
@@ -1575,6 +1627,7 @@ def main():
                             if len(text) < 100:
                                 _flash("warning", "Page content looks too short — try pasting manually.")
                                 st.session_state["fetch_stage"] = None
+                                _clear_pending_fetch_input()
                                 st.rerun()
                         except RuntimeError as e:
                             _flash(
@@ -1583,11 +1636,13 @@ def main():
                                 "Use the **paste manually** option above instead.",
                             )
                             st.session_state["fetch_stage"] = None
+                            _clear_pending_fetch_input()
                             st.rerun()
 
                 if not text:
                     _flash("warning", "Enter a URL or paste the job description.")
                     st.session_state["fetch_stage"] = None
+                    _clear_pending_fetch_input()
                     st.rerun()
 
                 st.session_state["fetch_text_content"] = text
@@ -1610,12 +1665,14 @@ def main():
                     except json.JSONDecodeError:
                         _flash("error", "AI returned unexpected output. Try again.")
                         st.session_state["fetch_stage"] = None
+                        _clear_pending_fetch_input()
                         st.rerun()
                     except Exception as e:
                         _flash("error", f"Parsing failed: {e}")
                         st.session_state["fetch_stage"] = None
+                        _clear_pending_fetch_input()
                         st.rerun()
-                _save_fetch_snapshot()
+                _save_fetch_snapshot()  # also clears any pending_* input markers (store.clear())
                 st.session_state["fetch_stage"] = "match"
                 st.rerun()
 
