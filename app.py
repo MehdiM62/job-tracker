@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import requests
 from bs4 import BeautifulSoup
 from groq import Groq
@@ -1003,49 +1002,6 @@ def _flash(kind: str, text: str) -> None:
     st.session_state["flash"] = (kind, text)
 
 
-STALE_TAB_RELOAD_THRESHOLD_MS = 20_000
-
-def _reload_on_return_if_stale(armed: bool) -> None:
-    """While `armed`, injects a tiny script that reloads the page if the browser tab
-    was hidden (backgrounded — screen lock, app switch, another tab) for at least
-    STALE_TAB_RELOAD_THRESHOLD_MS before becoming visible again.
-
-    Confirmed live: a mobile browser tab backgrounded mid Fetch & Parse (or mid a
-    submit's own "Saving..."/"Updating...") can come back to foreground still showing
-    that same in-progress spinner even once the actual result is long since ready — the
-    tab's own rendering was throttled while hidden, and nothing forces it to repaint
-    with the current state until some other interaction happens to trigger a rerun. A
-    plain page reload re-enters this same tab's code from the top, which is exactly
-    what the cross-session recovery elsewhere in this file is built to pick up cleanly,
-    so doing it here is safe even mid-flight — nothing gets lost or duplicated.
-
-    Callers must NOT arm this while sitting on an already-parsed review form: a field
-    edited there before clicking Add lives only in that unsubmitted browser-side widget
-    state, and a reload would silently discard it. Only stages where nothing editable
-    is on screen yet (a fetch/parse/match/dupcheck stage running, or a submit actually
-    in flight) are safe to arm."""
-    if not armed:
-        return
-    components.html(f"""
-    <script>
-    (function() {{
-        let hiddenAt = null;
-        document.addEventListener('visibilitychange', function() {{
-            if (document.visibilityState === 'hidden') {{
-                hiddenAt = Date.now();
-            }} else if (document.visibilityState === 'visible' && hiddenAt !== null) {{
-                const hiddenMs = Date.now() - hiddenAt;
-                hiddenAt = null;
-                if (hiddenMs >= {STALE_TAB_RELOAD_THRESHOLD_MS}) {{
-                    window.parent.location.reload();
-                }}
-            }}
-        }});
-    }})();
-    </script>
-    """, height=0)
-
-
 APPEND_JOB_DEDUP_WINDOW_DAYS = 3  # same value gmail_bulk.py's own final safety net uses
 
 
@@ -1722,10 +1678,6 @@ def main():
 
         _restore_fetch_snapshot_if_needed()
         _resume_pending_fetch_if_needed()
-        _reload_on_return_if_stale(
-            st.session_state.get("fetch_stage") is not None
-            or st.session_state.get("adding_job", False)
-        )
 
         k = st.session_state["input_key"]
 
@@ -2127,11 +2079,6 @@ def main():
 
         _restore_email_snapshot_if_needed()
         _resume_pending_email_if_needed()
-        _reload_on_return_if_stale(
-            st.session_state.get("parsing_email", False)
-            or st.session_state.get("adding_from_email", False)
-            or st.session_state.get("updating_sheet", False)
-        )
 
         ek = st.session_state["email_key"]
         email_text = st.text_area(
